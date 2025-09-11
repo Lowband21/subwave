@@ -33,4 +33,13 @@ pub enum Error {
     Framerate(f64),
     #[error("invalid pipeline state for operation")]
     InvalidState,
+    // Consolidated backend/platform errors
+    #[error("Wayland error: {0}")]
+    Wayland(String),
+    #[error("Not running on Wayland")]
+    NotWayland,
+    #[error("Failed to create subsurface: {0}")]
+    SubsurfaceCreation(String),
+    #[error("Pipeline error: {0}")]
+    Pipeline(String),
 }

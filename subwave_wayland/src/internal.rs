@@ -1,9 +1,9 @@
 use std::{sync::{atomic::AtomicBool, Arc}, thread::JoinHandle, time::{Duration, Instant}};
 
 use gstreamer::StreamCollection;
-use iced::futures::channel::mpsc;
+use std::sync::mpsc;
 use parking_lot::Mutex;
-use subwave_core::types::{AudioTrack, SubtitleTrack, VideoProperties};
+use subwave_core::video::types::{AudioTrack, SubtitleTrack, VideoProperties};
 
 use crate::{pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
 
@@ -19,6 +19,11 @@ pub(crate) struct Internal {
     pub(crate) video_props: Option<Arc<Mutex<VideoProperties>>>,
     pub(crate) duration: Option<Duration>,
     pub(crate) speed: f64,
+
+    // Playback state flags for trait support
+    pub(crate) looping: bool,
+    pub(crate) is_eos: bool,
+    pub(crate) restart_stream: bool,
 
     // Bus thread control
     pub(crate) bus_thread: Option<JoinHandle<()>>,

@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use crate::gstplayflags::gst_play_flags::GstPlayFlags;
 
-use crate::{position::Position, Error, Result, WaylandIntegration, WaylandSubsurfaceManager};
+use subwave_core::video::types::Position;
+use crate::{Error, Result, WaylandIntegration, WaylandSubsurfaceManager};
 
 pub struct SubsurfacePipeline {
     speed: f64,

@@ -1,22 +1,19 @@
 use crate::internal::Internal;
-use crate::position::Position;
 use crate::{
     pipeline::SubsurfacePipeline,
     subsurface_manager::WaylandSubsurfaceManager,
     Error,
-    Result,
     WaylandIntegration,
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer::State;
 use parking_lot::RwLock;
-use subwave_core::types::{AudioTrack, SubtitleTrack};
+use subwave_core::video::types::{AudioTrack, SubtitleTrack, Position};
 use subwave_core::video_trait::Video;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use std::result::Result;
 
 // Video is an exterior-facing newtype with a single interior RwLock
 pub struct SubsurfaceVideo(pub(crate) RwLock<Internal>);
@@ -24,8 +21,279 @@ pub struct SubsurfaceVideo(pub(crate) RwLock<Internal>);
 // Bus commands are closures applied on Internal on the UI thread
 pub type Cmd = Box<dyn FnOnce(&mut Internal) + Send + 'static>;
 
+// Implement the core Video trait for Wayland-backed SubsurfaceVideo
 impl Video for SubsurfaceVideo {
-    pub fn new(uri: &url::Url) -> Result<Self> {
+    type Video = SubsurfaceVideo;
+
+    fn new(uri: &url::Url) -> Result<Self::Video, subwave_core::Error> {
+        // Creating the video object itself can't fail here
+        Ok(SubsurfaceVideo(RwLock::new(Internal {
+            uri: uri.clone(),
+            pipeline: None,
+            subsurface: None,
+            video_props: None,
+            duration: None,
+            speed: 1.0,
+            looping: false,
+            is_eos: false,
+            restart_stream: false,
+            bus_thread: None,
+            bus_stop: Arc::new(AtomicBool::new(false)),
+            cmd_rx: None,
+            stream_collection: None,
+            available_subtitles: Vec::new(),
+            current_subtitle_track: None,
+            subtitles_enabled: false,
+            available_audio_tracks: Vec::new(),
+            current_audio_track: -1,
+            audio_index_to_stream_id: Vec::new(),
+            subtitle_index_to_stream_id: Vec::new(),
+            selected_stream_ids: Vec::new(),
+            last_position_update: Instant::now(),
+        })))
+    }
+
+    fn size(&self) -> (i32, i32) {
+        self.resolution().unwrap_or((0, 0))
+    }
+
+    fn framerate(&self) -> f64 {
+        // Query from current caps if available
+        if let Some(p) = self.0.read().pipeline.as_ref() {
+            if let Some(pad) = p
+                .pipeline
+                .by_name("vsink")
+                .and_then(|s| s.static_pad("sink"))
+            {
+                if let Some(caps) = pad.current_caps() {
+                    if let Some(s) = caps.structure(0) {
+                        if let Ok(fr) = s.get::<gst::Fraction>("framerate") {
+                            return fr.numer() as f64 / fr.denom() as f64;
+                        }
+                    }
+                }
+            }
+        }
+        0.0
+    }
+
+    fn volume(&self) -> f64 {
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .map(|p| p.pipeline.property::<f64>("volume"))
+            .unwrap_or(0.0)
+    }
+
+    fn set_volume(&mut self, volume: f64) {
+        if let Some(p) = self.0.read().pipeline.as_ref() {
+            p.pipeline.set_property("volume", volume);
+        }
+        // Preserve mute state
+        self.set_muted(self.muted());
+    }
+
+    fn muted(&self) -> bool {
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .map(|p| p.pipeline.property::<bool>("mute"))
+            .unwrap_or(false)
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        if let Some(p) = self.0.read().pipeline.as_ref() {
+            p.pipeline.set_property("mute", muted);
+        }
+    }
+
+    fn eos(&self) -> bool {
+        self.0.read().is_eos
+    }
+
+    fn looping(&self) -> bool {
+        self.0.read().looping
+    }
+
+    fn set_looping(&mut self, looping: bool) {
+        self.0.write().looping = looping;
+    }
+
+    fn restart_stream(&mut self) -> std::result::Result<(), subwave_core::Error> {
+        // Attempt immediate restart if pipeline exists
+        let p = self.0.read().pipeline.clone();
+        if let Some(p) = p {
+            p.seek(Position::Time(Duration::ZERO), true)
+                .map_err(|_| subwave_core::Error::InvalidState)?;
+            p.play().map_err(|_| subwave_core::Error::InvalidState)?;
+            let mut w = self.0.write();
+            w.is_eos = false;
+            w.restart_stream = false;
+            Ok(())
+        } else {
+            // Otherwise, schedule restart on next tick
+            self.0.write().restart_stream = true;
+            Ok(())
+        }
+    }
+
+    fn paused(&self) -> bool {
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .map(|p| p.pipeline.current_state() == gst::State::Paused)
+            .unwrap_or(true)
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        if let Some(p) = self.0.read().pipeline.clone() {
+            let _ = if paused { p.pause() } else { p.play() };
+        }
+    }
+
+    fn speed(&self) -> f64 {
+        self.0.read().speed
+    }
+
+    fn set_speed(&mut self, speed: f64) -> Result<(), subwave_core::Error> {
+        // Update and apply via seek-rate
+        {
+            let mut w = self.0.write();
+            w.speed = speed;
+        }
+        if let Some(p) = self.0.read().pipeline.clone() {
+            p.set_playback_rate(speed)
+                .map_err(|_| subwave_core::Error::InvalidState)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn position(&self) -> Duration {
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .and_then(|p| p.pipeline.query_position::<gst::ClockTime>())
+            .map(|ct| Duration::from_nanos(ct.nseconds()))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn seek(&mut self, position: impl Into<Position>, accurate: bool) -> Result<(), subwave_core::Error> {
+        if let Some(p) = self.0.read().pipeline.clone() {
+            p.seek(position, accurate)
+                .map_err(|_| subwave_core::Error::InvalidState)
+        } else {
+            Err(subwave_core::Error::InvalidState)
+        }
+    }
+
+    fn duration(&self) -> Duration {
+        if let Some(d) = self.0.read().duration {
+            d
+        } else {
+            self.0
+                .read()
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.pipeline.query_duration::<gst::ClockTime>())
+                .map(|ct| Duration::from_nanos(ct.nseconds()))
+                .unwrap_or(Duration::ZERO)
+        }
+    }
+
+    fn subtitle_url(&self) -> Option<url::Url> {
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .map(|p| p.pipeline.property::<String>("suburi"))
+            .and_then(|s| url::Url::parse(&s).ok())
+    }
+
+    fn set_subtitle_url(&mut self, url: &url::Url) -> Result<(), subwave_core::Error> {
+        if let Some(p) = self.0.read().pipeline.as_ref() {
+            // Safest to set while PAUSED/READY, similar to appsink impl
+            let _ = p.pipeline.set_state(gst::State::Ready);
+            p.pipeline.set_property("suburi", url.as_str());
+            let _ = p.pipeline.set_state(gst::State::Playing);
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn subtitles_enabled(&self) -> bool {
+        self.0.read().subtitles_enabled
+    }
+
+    fn set_subtitles_enabled(&mut self, enabled: bool) {
+        // Best-effort: select default or disable
+        if enabled {
+            let idx = {
+                let r = self.0.read();
+                if r.current_subtitle_track.is_some() {
+                    r.current_subtitle_track
+                } else if !r.subtitle_index_to_stream_id.is_empty() {
+                    Some(0)
+                } else {
+                    None
+                }
+            };
+            if let Some(i) = idx {
+                let _ = SubsurfaceVideo::select_subtitle_track(self, Some(i));
+            }
+        } else {
+            let _ = SubsurfaceVideo::select_subtitle_track(self, None);
+        }
+    }
+
+    fn subtitle_tracks(&mut self) -> Vec<SubtitleTrack> {
+        self.0.read().available_subtitles.clone()
+    }
+
+    fn current_subtitle_track(&self) -> Option<i32> {
+        self.0.read().current_subtitle_track
+    }
+
+    fn select_subtitle_track(&mut self, track_index: Option<i32>) -> Result<(), subwave_core::Error> {
+        SubsurfaceVideo::select_subtitle_track(self, track_index)
+            .map_err(|_| subwave_core::Error::InvalidState)
+    }
+
+    fn audio_tracks(&mut self) -> Vec<AudioTrack> {
+        self.0.read().available_audio_tracks.clone()
+    }
+
+    fn current_audio_track(&self) -> i32 {
+        self.current_audio_track()
+    }
+
+    fn select_audio_track(&mut self, track_index: i32) -> Result<(), subwave_core::Error> {
+        SubsurfaceVideo::select_audio_track(self, track_index)
+            .map_err(|_| subwave_core::Error::InvalidState)
+    }
+
+    fn has_video(&self) -> bool {
+        self.resolution().map(|(w, h)| w > 0 && h > 0).unwrap_or(false)
+    }
+
+    fn pipeline(&self) -> gst::Pipeline {
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .map(|p| p.pipeline.as_ref().clone())
+            .unwrap_or_else(|| gst::Pipeline::default())
+    }
+}
+
+
+impl SubsurfaceVideo {
+    pub fn new(uri: &url::Url) -> Result<Self, Error> {
         let inner = Internal {
             uri: uri.clone(),
             pipeline: None,
@@ -33,6 +301,9 @@ impl Video for SubsurfaceVideo {
             video_props: None,
             duration: None,
             speed: 1.0,
+            looping: false,
+            is_eos: false,
+            restart_stream: false,
             bus_thread: None,
             bus_stop: Arc::new(AtomicBool::new(false)),
             cmd_rx: None,
@@ -59,7 +330,7 @@ impl Video for SubsurfaceVideo {
         &self,
         integration: WaylandIntegration,
         bounds: (i32, i32, i32, i32),
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // Construct subsurface and pipeline (no lock held during external calls)
         let subsurface = WaylandSubsurfaceManager::new(integration.clone())?;
         let pipeline = Arc::new(SubsurfacePipeline::new(
@@ -94,19 +365,6 @@ impl Video for SubsurfaceVideo {
                         if pipe.send_event(evt) {
                             return true;
                         }
-                        // Fallbacks if needed
-                        //if let Some(vsink) = pipe.by_name("vsink") {
-                        //    let evt2 = gst::event::SelectStreams::new(ids.iter().map(|s| s.as_str()));
-                        //    if vsink.send_event(evt2) {
-                        //        return true;
-                        //    }
-                        //}
-                        //if let Some(asink) = pipe.by_name("audiosink") {
-                        //    let evt3 = gst::event::SelectStreams::new(ids.iter().map(|s| s.as_str()));
-                        //    if asink.send_event(evt3) {
-                        //        return true;
-                        //    }
-                        //}
                         false
                     }
 
@@ -114,19 +372,17 @@ impl Video for SubsurfaceVideo {
                         if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
                             match msg.view() {
                                 MessageView::Eos(_) => {
-                                    //if tx.send(Box::new(|s: &mut Internal| s.state //= State::Stopped)).is_err() {
-                                    //    log::debug!("[bus] receiver dropped; //exiting bus thread");
-                                    //    break;
-                                    //}
-                                    break;
+                                    // Mark EOS and schedule restart on UI thread if looping
+                                    let _ = tx.send(Box::new(|s: &mut Internal| {
+                                        s.is_eos = true;
+                                        if s.looping {
+                                            s.restart_stream = true;
+                                        }
+                                    }));
                                 }
                                 MessageView::Error(err) => {
                                     log::error!("Pipeline error: {:?}", err);
-                                    //if tx.send(Box::new(|s: &mut Internal| //s.pipeline = State::Paused)).is_err() {
-                                    //    log::debug!("[bus] receiver dropped; //exiting bus thread");
-                                    //    break;
-                                    //}
-                                    break;
+                                    // Keep the bus thread alive to allow recovery strategies if needed
                                 }
                                 MessageView::DurationChanged(_) => {
                                     let dur = gst_pipeline
@@ -238,7 +494,7 @@ impl Video for SubsurfaceVideo {
                                     let current_audio_index = if audio_ids.is_empty() { -1 } else { 0 };
                                     let current_sub_index = if subtitles_enabled { Some(0) } else { None };
 
-// Update internal state immediately to expose available tracks
+                                    // Update internal state immediately to expose available tracks
                                     let coll_clone = collection.clone();
                                     let tx_tracks = tx.clone();
                                     let ids_for_state = initial_ids.clone();
@@ -384,6 +640,19 @@ impl Video for SubsurfaceVideo {
                     None => break,
                 }
             }
+            // Handle scheduled restart on UI thread
+            if w.restart_stream {
+                if let Some(p) = w.pipeline.clone() {
+                    // Try to restart playback from beginning
+                    if p.seek(Position::Time(Duration::ZERO), true).is_ok() {
+                        let _ = p.play();
+                        w.is_eos = false;
+                        w.restart_stream = false;
+                    }
+                } else {
+                    // No pipeline yet; keep the flag true and retry next tick
+                }
+            }
         }
         // 2) Drain subtitle frames without holding the lock
         //if let Some(p) = self.0.read().pipeline.clone() {
@@ -392,29 +661,27 @@ impl Video for SubsurfaceVideo {
     }
 
     // Control
-    pub fn play(&self) -> Result<()> {
+    pub fn play(&self) -> Result<(), Error> {
         let p = self.0.read().pipeline.clone();
         if let Some(p) = p {
             p.play()?;
-            self.0.write().state = PlaybackState::Playing;
             Ok(())
         } else {
-            Err(Error::Pipeline("Video not initialized".into()))
+            Err(subwave_core::Error::Pipeline("Video not initialized".into()))
         }
     }
 
-    pub fn pause(&self) -> Result<()> {
+    pub fn pause(&self) -> Result<(), Error> {
         let p = self.0.read().pipeline.clone();
         if let Some(p) = p {
             p.pause()?;
-            self.0.write().state = PlaybackState::Paused;
             Ok(())
         } else {
             Err(Error::Pipeline("Video not initialized".into()))
         }
     }
 
-    pub fn stop(&self) -> Result<()> {
+    pub fn stop(&self) -> Result<(), Error> {
         // Signal thread and join
         let handle = {
             let mut w = self.0.write();
@@ -427,12 +694,11 @@ impl Video for SubsurfaceVideo {
         // Stop pipeline
         if let Some(p) = self.0.read().pipeline.clone() {
             p.stop()?;
-            self.0.write().state = PlaybackState::Stopped;
         }
         Ok(())
     }
 
-    pub fn toggle_play(&self) -> Result<()> {
+    pub fn toggle_play(&self) -> Result<(), Error> {
         if self.is_playing() {
             self.pause()
         } else {
@@ -442,10 +708,20 @@ impl Video for SubsurfaceVideo {
 
     // Queries
     pub fn is_playing(&self) -> bool {
-        self.0.read().state == PlaybackState::Playing
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .map(|p| p.pipeline.current_state() == gst::State::Playing)
+            .unwrap_or(false)
     }
     pub fn is_paused(&self) -> bool {
-        self.0.read().state == PlaybackState::Paused
+        self.0
+            .read()
+            .pipeline
+            .as_ref()
+            .map(|p| p.pipeline.current_state() == gst::State::Paused)
+            .unwrap_or(false)
     }
 
     pub fn position(&self) -> Option<Duration> {
@@ -466,7 +742,7 @@ impl Video for SubsurfaceVideo {
             .map(|ct| Duration::from_nanos(ct.nseconds()))
     }
 
-    pub fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<()> {
+    pub fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
         if let Some(p) = self.0.read().pipeline.clone() {
             p.seek(position, accurate)
         } else {
@@ -525,7 +801,7 @@ impl Video for SubsurfaceVideo {
     }
 
     // Audio/volume/rate
-    pub fn set_volume(&self, volume: f64) -> Result<()> {
+    pub fn set_volume(&self, volume: f64) -> Result<(), Error> {
         if let Some(p) = self.0.read().pipeline.clone() {
             p.set_volume(volume)
         } else {
@@ -533,7 +809,7 @@ impl Video for SubsurfaceVideo {
         }
     }
 
-    pub fn set_playback_rate(&self, rate: f64) -> Result<()> {
+    pub fn set_playback_rate(&self, rate: f64) -> Result<(), Error> {
         if let Some(p) = self.0.read().pipeline.clone() {
             p.set_playback_rate(rate)
         } else {
@@ -546,7 +822,7 @@ impl Video for SubsurfaceVideo {
         if w.current_audio_track >= 0 {
             w.current_audio_track
         } else {
-            w.metadata.current_audio_track
+            -1
         }
     }
 
@@ -554,15 +830,15 @@ impl Video for SubsurfaceVideo {
         self.0.read().current_subtitle_track
     }
 
-    pub fn audio_tracks_info(&self) -> Vec<WaylandAudioTrack> {
+    pub fn audio_tracks_info(&self) -> Vec<AudioTrack> {
         self.0.read().available_audio_tracks.clone()
     }
 
-    pub fn subtitle_tracks_info(&self) -> Vec<WaylandSubtitleTrack> {
-        self.0.read().available_subtitle_tracks.clone()
+    pub fn subtitle_tracks_info(&self) -> Vec<SubtitleTrack> {
+        self.0.read().available_subtitles.clone()
     }
 
-    pub fn select_audio_track(&self, index: i32) -> Result<()> {
+    pub fn select_audio_track(&self, index: i32) -> Result<(), Error> {
         // Gather required info without holding the lock during GStreamer calls
         let (p, mut new_ids, audio_ids) = {
             let r = self.0.read();
@@ -596,7 +872,7 @@ impl Video for SubsurfaceVideo {
         }
     }
 
-    pub fn select_subtitle_track(&self, index: Option<i32>) -> Result<()> {
+    pub fn select_subtitle_track(&self, index: Option<i32>) -> Result<(), Error> {
         let (p, mut new_ids, sub_ids) = {
             let r = self.0.read();
             let p = r.pipeline.clone();
@@ -639,7 +915,7 @@ impl Video for SubsurfaceVideo {
         self.0.read().subtitles_enabled
     }
 
-    pub fn set_subtitles_enabled(&self, enabled: bool) -> Result<()> {
+    pub fn set_subtitles_enabled(&self, enabled: bool) -> Result<(), Error> {
         if enabled == self.subtitles_enabled() {
             return Ok(());
         }
@@ -662,10 +938,7 @@ impl Video for SubsurfaceVideo {
         }
     }
 
-    // Metadata accessors
-    pub fn metadata(&self) -> VideoMetadata {
-        self.0.read().metadata.clone()
-    }
+
 
     pub fn get_subsurface(&self) -> Option<Arc<WaylandSubsurfaceManager>> {
         self.0.read().subsurface.clone()
@@ -689,7 +962,7 @@ fn dedup_in_place(v: &mut Vec<String>) {
     v.retain(|s| seen.insert(s.clone()));
 }
 
-impl Drop for Video {
+impl Drop for SubsurfaceVideo {
     fn drop(&mut self) {
         // Best-effort cleanup without panicking
         let handle = {
