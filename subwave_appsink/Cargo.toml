@@ -1,0 +1,22 @@
+[package]
+name = "subwave_appsink"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+#repository.workspace = true
+#documentation.workspace = true
+#homepage.workspace = true
+
+[dependencies]
+iced.workspace = true
+iced_wgpu.workspace = true
+
+log.workspace = true
+url.workspace = true
+
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+
+subwave_core = { path = "../subwave_core" }

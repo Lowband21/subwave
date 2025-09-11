@@ -1,0 +1,11 @@
+[package]
+name = "subwave_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+
+url.workspace = true
+thiserror.workspace = true
