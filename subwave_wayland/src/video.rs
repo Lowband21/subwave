@@ -1,19 +1,18 @@
 use crate::internal::Internal;
 use crate::{
-    pipeline::SubsurfacePipeline,
-    subsurface_manager::WaylandSubsurfaceManager,
-    Error,
+    pipeline::SubsurfacePipeline, subsurface_manager::WaylandSubsurfaceManager, Error,
     WaylandIntegration,
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use parking_lot::RwLock;
-use subwave_core::video::types::{AudioTrack, SubtitleTrack, Position};
-use subwave_core::video_trait::Video;
+use std::result::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use std::result::Result;
+use subwave_core::types::PendingState;
+use subwave_core::video::types::{AudioTrack, Position, SubtitleTrack};
+use subwave_core::video_trait::Video;
 
 // Video is an exterior-facing newtype with a single interior RwLock
 pub struct SubsurfaceVideo(pub(crate) RwLock<Internal>);
@@ -49,6 +48,7 @@ impl Video for SubsurfaceVideo {
             audio_index_to_stream_id: Vec::new(),
             subtitle_index_to_stream_id: Vec::new(),
             selected_stream_ids: Vec::new(),
+            pending_state: None,
             last_position_update: Instant::now(),
         })))
     }
@@ -182,7 +182,11 @@ impl Video for SubsurfaceVideo {
             .unwrap_or(Duration::ZERO)
     }
 
-    fn seek(&mut self, position: impl Into<Position>, accurate: bool) -> Result<(), subwave_core::Error> {
+    fn seek(
+        &mut self,
+        position: impl Into<Position>,
+        accurate: bool,
+    ) -> Result<(), subwave_core::Error> {
         if let Some(p) = self.0.read().pipeline.clone() {
             p.seek(position, accurate)
                 .map_err(|_| subwave_core::Error::InvalidState)
@@ -210,7 +214,7 @@ impl Video for SubsurfaceVideo {
             .read()
             .pipeline
             .as_ref()
-            .map(|p| p.pipeline.property::<String>("suburi"))
+            .and_then(|p| p.pipeline.property::<Option<String>>("suburi"))
             .and_then(|s| url::Url::parse(&s).ok())
     }
 
@@ -259,7 +263,10 @@ impl Video for SubsurfaceVideo {
         self.0.read().current_subtitle_track
     }
 
-    fn select_subtitle_track(&mut self, track_index: Option<i32>) -> Result<(), subwave_core::Error> {
+    fn select_subtitle_track(
+        &mut self,
+        track_index: Option<i32>,
+    ) -> Result<(), subwave_core::Error> {
         SubsurfaceVideo::select_subtitle_track(self, track_index)
             .map_err(|_| subwave_core::Error::InvalidState)
     }
@@ -278,7 +285,9 @@ impl Video for SubsurfaceVideo {
     }
 
     fn has_video(&self) -> bool {
-        self.resolution().map(|(w, h)| w > 0 && h > 0).unwrap_or(false)
+        self.resolution()
+            .map(|(w, h)| w > 0 && h > 0)
+            .unwrap_or(false)
     }
 
     fn pipeline(&self) -> gst::Pipeline {
@@ -287,10 +296,9 @@ impl Video for SubsurfaceVideo {
             .pipeline
             .as_ref()
             .map(|p| p.pipeline.as_ref().clone())
-            .unwrap_or_else(|| gst::Pipeline::default())
+            .unwrap_or_else(gst::Pipeline::default)
     }
 }
-
 
 impl SubsurfaceVideo {
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
@@ -319,6 +327,7 @@ impl SubsurfaceVideo {
             audio_index_to_stream_id: Vec::new(),
             subtitle_index_to_stream_id: Vec::new(),
             selected_stream_ids: Vec::new(),
+            pending_state: None,
             last_position_update: Instant::now(),
         };
         Ok(SubsurfaceVideo(RwLock::new(inner)))
@@ -486,7 +495,7 @@ impl SubsurfaceVideo {
                                     // Compute initial selection
                                     let mut initial_ids: Vec<String> = Vec::new();
                                     if let Some(v) = first_video_id.clone() { initial_ids.push(v); }
-                                    if let Some(aid) = audio_ids.get(0) { initial_ids.push(aid.clone()); }
+                                    if let Some(aid) = audio_ids.first() { initial_ids.push(aid.clone()); }
                                     let chosen_text = best_text_id.or(any_text_id);
                                     if let Some(tid) = chosen_text.clone() { initial_ids.push(tid); }
 
@@ -531,15 +540,15 @@ impl SubsurfaceVideo {
                                 }
                                 MessageView::StreamsSelected(sel) => {
                                     let collection = sel.stream_collection();
-                                    let mut n_audio = 0;
-                                    let mut n_subtitle = 0;
-                                    for i in 0..collection.len() {
-                                        if let Some(stream) = collection.stream(i as u32) {
-                                            let st = stream.stream_type();
-                                            if st.contains(gst::StreamType::AUDIO) { n_audio += 1; }
-                                            if st.contains(gst::StreamType::TEXT) { n_subtitle += 1; }
-                                        }
+                                    let mut _n_audio = 0;
+                                    let mut _n_subtitle = 0;
+                                for i in 0..collection.len() {
+                                    if let Some(stream) = collection.stream(i as u32) {
+                                        let st = stream.stream_type();
+                                        if st.contains(gst::StreamType::AUDIO) { _n_audio += 1; }
+                                        if st.contains(gst::StreamType::TEXT) { _n_subtitle += 1; }
                                     }
+                                }
                                 }
                                 MessageView::StateChanged(state_changed) => {
                                     if let Some(src) = msg.src() {
@@ -623,9 +632,9 @@ impl SubsurfaceVideo {
     }
 
     // Drain pending bus commands and pump subtitles. Intended to be called on UI/redraw ticks.
-    pub fn tick(&self) {
+    pub fn tick(&mut self) {
         // 1) Apply pending commands with a short write lock
-        {
+        let pending = {
             let mut w = self.0.write();
             loop {
                 let cmd_opt = {
@@ -643,21 +652,34 @@ impl SubsurfaceVideo {
             // Handle scheduled restart on UI thread
             if w.restart_stream {
                 if let Some(p) = w.pipeline.clone() {
-                    // Try to restart playback from beginning
                     if p.seek(Position::Time(Duration::ZERO), true).is_ok() {
                         let _ = p.play();
                         w.is_eos = false;
                         w.restart_stream = false;
                     }
-                } else {
-                    // No pipeline yet; keep the flag true and retry next tick
                 }
             }
+            // Take any pending state to apply outside the lock
+            w.pending_state.take()
+        };
+
+        // 2) Apply pending state when pipeline is ready
+        if let Some(st) = pending {
+            let has_pipeline = self.0.read().pipeline.is_some();
+            if has_pipeline {
+                // Best-effort apply; if not ready, requeue
+                let requeue = self.apply_state_now(&st).is_err();
+                if requeue {
+                    let mut w = self.0.write();
+                    w.pending_state = Some(st);
+                }
+            } else {
+                let mut w = self.0.write();
+                w.pending_state = Some(st);
+            }
         }
-        // 2) Drain subtitle frames without holding the lock
-        //if let Some(p) = self.0.read().pipeline.clone() {
-        //    p.drain_subtitles();
-        //}
+
+        // 3) (Optional) subtitle draining could happen here
     }
 
     // Control
@@ -667,7 +689,9 @@ impl SubsurfaceVideo {
             p.play()?;
             Ok(())
         } else {
-            Err(subwave_core::Error::Pipeline("Video not initialized".into()))
+            Err(subwave_core::Error::Pipeline(
+                "Video not initialized".into(),
+            ))
         }
     }
 
@@ -707,6 +731,34 @@ impl SubsurfaceVideo {
     }
 
     // Queries
+    fn apply_state_now(&mut self, st: &PendingState) -> Result<(), ()> {
+        // Pause first, ignore errors
+        let _ = self.pause();
+        let _ = self.select_audio_track(st.audio_track);
+        let _ = self.select_subtitle_track(st.subtitle_track);
+        self.set_subtitles_enabled(st.subtitles_enabled);
+        if let Some(url) = &st.subtitle_url {
+            let _ = self.set_subtitle_url(url);
+        }
+        if self.seek(st.position, true).is_err() {
+            return Err(());
+        }
+        self.set_volume(st.volume);
+        self.set_muted(st.muted);
+        let _ = self.set_playback_rate(st.speed);
+        if st.paused {
+            let _ = self.pause();
+        } else {
+            let _ = self.play();
+        }
+        Ok(())
+    }
+
+    pub fn queue_pending_state(&self, st: PendingState) {
+        let mut w = self.0.write();
+        w.pending_state = Some(st);
+    }
+
     pub fn is_playing(&self) -> bool {
         self.0
             .read()
@@ -724,22 +776,21 @@ impl SubsurfaceVideo {
             .unwrap_or(false)
     }
 
-    pub fn position(&self) -> Option<Duration> {
-        self.0
-            .read()
-            .pipeline
-            .as_ref()
-            .and_then(|p| p.pipeline.query_position::<gst::ClockTime>())
-            .map(|ct| Duration::from_nanos(ct.nseconds()))
-    }
-
-    pub fn duration(&self) -> Option<Duration> {
-        self.0
-            .read()
-            .pipeline
-            .as_ref()
-            .and_then(|p| p.pipeline.query_duration::<gst::ClockTime>())
-            .map(|ct| Duration::from_nanos(ct.nseconds()))
+    fn position(&self) -> Duration {
+        let inner = self.0.read();
+        if let Some(pipeline) = &inner.pipeline {
+            // Query position when pipeline is stable
+            if let Some(pos) = pipeline.pipeline.query_position::<gst::ClockTime>() {
+                
+                //pipeline.last_valid_position = Some(pos_dur);
+                Duration::from_nanos(pos.nseconds())
+            } else {
+                // Return last known position if query fails
+                pipeline.last_valid_position.unwrap_or(Duration::ZERO)
+            }
+        } else {
+            Duration::ZERO
+        }
     }
 
     pub fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
@@ -844,7 +895,10 @@ impl SubsurfaceVideo {
             let r = self.0.read();
             let p = r.pipeline.clone();
             if index < 0 || (index as usize) >= r.audio_index_to_stream_id.len() {
-                return Err(Error::Pipeline(format!("Invalid audio track index: {}", index)));
+                return Err(Error::Pipeline(format!(
+                    "Invalid audio track index: {}",
+                    index
+                )));
             }
             let mut ids = r.selected_stream_ids.clone();
             // Remove any existing audio IDs
@@ -854,7 +908,9 @@ impl SubsurfaceVideo {
             (p, ids, r.audio_index_to_stream_id.clone())
         };
 
-        let Some(p) = p else { return Err(Error::Pipeline("Video not initialized".into())); };
+        let Some(p) = p else {
+            return Err(Error::Pipeline("Video not initialized".into()));
+        };
         let target_id = audio_ids[index as usize].clone();
         // Append new audio id
         new_ids.push(target_id);
@@ -868,7 +924,9 @@ impl SubsurfaceVideo {
             w.current_audio_track = index;
             Ok(())
         } else {
-            Err(Error::Pipeline("Failed to send SelectStreams for audio".into()))
+            Err(Error::Pipeline(
+                "Failed to send SelectStreams for audio".into(),
+            ))
         }
     }
 
@@ -884,13 +942,18 @@ impl SubsurfaceVideo {
             (p, ids, r.subtitle_index_to_stream_id.clone())
         };
 
-        let Some(p) = p else { return Err(Error::Pipeline("Video not initialized".into())); };
+        let Some(p) = p else {
+            return Err(Error::Pipeline("Video not initialized".into()));
+        };
 
         let mut new_current: Option<i32> = None;
         let mut enabled = false;
         if let Some(i) = index {
             if i < 0 || (i as usize) >= sub_ids.len() {
-                return Err(Error::Pipeline(format!("Invalid subtitle track index: {}", i)));
+                return Err(Error::Pipeline(format!(
+                    "Invalid subtitle track index: {}",
+                    i
+                )));
             }
             let sid = sub_ids[i as usize].clone();
             new_ids.push(sid);
@@ -907,7 +970,9 @@ impl SubsurfaceVideo {
             w.subtitles_enabled = enabled;
             Ok(())
         } else {
-            Err(Error::Pipeline("Failed to send SelectStreams for subtitles".into()))
+            Err(Error::Pipeline(
+                "Failed to send SelectStreams for subtitles".into(),
+            ))
         }
     }
 
@@ -931,14 +996,16 @@ impl SubsurfaceVideo {
                     None
                 }
             };
-            if let Some(i) = default_idx { self.select_subtitle_track(Some(i)) } else { Ok(()) }
+            if let Some(i) = default_idx {
+                self.select_subtitle_track(Some(i))
+            } else {
+                Ok(())
+            }
         } else {
             // Disable
             self.select_subtitle_track(None)
         }
     }
-
-
 
     pub fn get_subsurface(&self) -> Option<Arc<WaylandSubsurfaceManager>> {
         self.0.read().subsurface.clone()

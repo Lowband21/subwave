@@ -1,7 +1,17 @@
-use std::{sync::{atomic::AtomicBool, Arc, Mutex}, time::{Duration, Instant}};
+use std::{
+    sync::{Arc, Mutex, atomic::AtomicBool},
+    time::{Duration, Instant},
+};
 
-use gstreamer::{self as gst, glib::object::{Cast, ObjectExt}, prelude::{ElementExt, ElementExtManual, GstBinExt}};
-use subwave_core::{video::types::{AudioTrack, Position, SubtitleTrack, VideoProperties}, Error};
+use gstreamer::{
+    self as gst,
+    glib::object::{Cast, ObjectExt},
+    prelude::{ElementExt, ElementExtManual, GstBinExt},
+};
+use subwave_core::{
+    Error,
+    video::types::{AudioTrack, Position, SubtitleTrack, VideoProperties},
+};
 
 #[derive(Debug)]
 pub(crate) struct Internal {
@@ -56,7 +66,6 @@ pub(crate) struct Internal {
     // Stream collection for playbin3
     pub(crate) stream_collection: Option<gst::StreamCollection>,
     pub(crate) selected_stream_ids: Vec<String>,
-
     // HDR metadata
     //pub(crate) hdr_metadata: Option<HdrMetadata>,
 }
@@ -230,7 +239,7 @@ impl Internal {
             self.sync_av_counter += 1;
             self.sync_av_avg = self.sync_av_avg * (self.sync_av_counter - 1) / self.sync_av_counter
                 + offset.as_nanos() as u64 / self.sync_av_counter;
-            if self.sync_av_counter % 128 == 0 {
+            if self.sync_av_counter.is_multiple_of(128) {
                 self.source
                     .set_property("av-offset", -(self.sync_av_avg as i64));
             }
@@ -240,9 +249,11 @@ impl Internal {
     /// Monitor connection speed from queue2 buffer statistics
     pub(crate) fn update_connection_stats(&mut self) {
         // Try to find the queue2 element in our video sink
-        let video_sink: gst::Element = self.source.property("video-sink");
-        if let Ok(video_sink_bin) = video_sink.dynamic_cast::<gst::Bin>() {
-            if let Some(buffer) = video_sink_bin.by_name("video-buffer") {
+        let Some(video_sink) = self.source.property::<Option<gst::Element>>("video-sink") else {
+            return;
+        };
+        if let Ok(video_sink_bin) = video_sink.dynamic_cast::<gst::Bin>()
+            && let Some(buffer) = video_sink_bin.by_name("video-buffer") {
                 // Check if this is actually a queue2 element that has the properties we need
                 if buffer.has_property("avg-in-rate") {
                     // Get average input rate
@@ -269,7 +280,6 @@ impl Internal {
                     log::trace!("Buffer element is not queue2, skipping stats update");
                 }
             }
-        }
     }
 
     /// Check if error should trigger reconnection attempt
@@ -384,8 +394,8 @@ impl Internal {
 
         // Find and add video stream(s)
         for i in 0..collection.len() {
-            if let Some(stream) = collection.stream(i as u32) {
-                if stream.stream_type() == gst::StreamType::VIDEO {
+            if let Some(stream) = collection.stream(i as u32)
+                && stream.stream_type() == gst::StreamType::VIDEO {
                     // Check if this stream was previously selected
                     if let Some(stream_id) = stream.stream_id() {
                         let stream_id_str = stream_id.to_string();
@@ -394,14 +404,13 @@ impl Internal {
                         }
                     }
                 }
-            }
         }
 
         // Find and add audio stream(s)
         let mut audio_index = 0;
         for i in 0..collection.len() {
-            if let Some(stream) = collection.stream(i as u32) {
-                if stream.stream_type() == gst::StreamType::AUDIO {
+            if let Some(stream) = collection.stream(i as u32)
+                && stream.stream_type() == gst::StreamType::AUDIO {
                     if audio_index == self.current_audio_track {
                         new_selection.push(
                             stream
@@ -412,7 +421,6 @@ impl Internal {
                     }
                     audio_index += 1;
                 }
-            }
         }
 
         // Handle subtitle selection
@@ -431,8 +439,8 @@ impl Internal {
                 // Find and add the subtitle stream
                 let mut subtitle_index = 0;
                 for i in 0..collection.len() {
-                    if let Some(stream) = collection.stream(i as u32) {
-                        if stream.stream_type() == gst::StreamType::TEXT {
+                    if let Some(stream) = collection.stream(i as u32)
+                        && stream.stream_type() == gst::StreamType::TEXT {
                             if subtitle_index == index {
                                 new_selection.push(
                                     stream
@@ -444,7 +452,6 @@ impl Internal {
                             }
                             subtitle_index += 1;
                         }
-                    }
                 }
 
                 self.current_subtitle_track = Some(index);
@@ -533,8 +540,8 @@ impl Internal {
 
         // Find and add video stream(s)
         for i in 0..collection.len() {
-            if let Some(stream) = collection.stream(i as u32) {
-                if stream.stream_type() == gst::StreamType::VIDEO {
+            if let Some(stream) = collection.stream(i as u32)
+                && stream.stream_type() == gst::StreamType::VIDEO {
                     // Check if this stream was previously selected
                     if let Some(stream_id) = stream.stream_id() {
                         let stream_id_str = stream_id.to_string();
@@ -543,14 +550,13 @@ impl Internal {
                         }
                     }
                 }
-            }
         }
 
         // Find and add the selected audio stream
         let mut audio_index = 0;
         for i in 0..collection.len() {
-            if let Some(stream) = collection.stream(i as u32) {
-                if stream.stream_type() == gst::StreamType::AUDIO {
+            if let Some(stream) = collection.stream(i as u32)
+                && stream.stream_type() == gst::StreamType::AUDIO {
                     if audio_index == track_index {
                         new_selection.push(
                             stream
@@ -561,16 +567,15 @@ impl Internal {
                     }
                     audio_index += 1;
                 }
-            }
         }
 
         // Add current subtitle stream if enabled
-        if self.subtitles_enabled {
-            if let Some(subtitle_track) = self.current_subtitle_track {
+        if self.subtitles_enabled
+            && let Some(subtitle_track) = self.current_subtitle_track {
                 let mut subtitle_index = 0;
                 for i in 0..collection.len() {
-                    if let Some(stream) = collection.stream(i as u32) {
-                        if stream.stream_type() == gst::StreamType::TEXT {
+                    if let Some(stream) = collection.stream(i as u32)
+                        && stream.stream_type() == gst::StreamType::TEXT {
                             if subtitle_index == subtitle_track {
                                 new_selection.push(
                                     stream
@@ -582,10 +587,8 @@ impl Internal {
                             }
                             subtitle_index += 1;
                         }
-                    }
                 }
             }
-        }
 
         self.current_audio_track = track_index;
 
@@ -654,8 +657,8 @@ impl Internal {
                         }
 
                         // Extract info from caps if available
-                        if let Some(caps) = caps {
-                            if let Some(s) = caps.structure(0) {
+                        if let Some(caps) = caps
+                            && let Some(s) = caps.structure(0) {
                                 if let Ok(rate) = s.get::<i32>("rate") {
                                     audio_track.sample_rate = Some(rate);
                                 }
@@ -663,15 +666,13 @@ impl Internal {
                                     audio_track.channels = Some(channels);
                                 }
                             }
-                        }
 
                         // If stream is selected by default, track it
-                        if stream.stream_flags().contains(gst::StreamFlags::SELECT) {
-                            if let Some(id) = stream_id {
+                        if stream.stream_flags().contains(gst::StreamFlags::SELECT)
+                            && let Some(id) = stream_id {
                                 self.selected_stream_ids.push(id.to_string());
                                 self.current_audio_track = audio_track.index;
                             }
-                        }
 
                         self.available_audio_tracks.push(audio_track);
                     }
@@ -699,23 +700,21 @@ impl Internal {
                         }
 
                         // If stream is selected by default, track it
-                        if stream.stream_flags().contains(gst::StreamFlags::SELECT) {
-                            if let Some(id) = stream_id {
+                        if stream.stream_flags().contains(gst::StreamFlags::SELECT)
+                            && let Some(id) = stream_id {
                                 self.selected_stream_ids.push(id.to_string());
                                 self.current_subtitle_track = Some(subtitle_track.index);
                                 self.subtitles_enabled = true;
                             }
-                        }
 
                         self.available_subtitles.push(subtitle_track);
                     }
                     gst::StreamType::VIDEO => {
                         // Track selected video streams
-                        if stream.stream_flags().contains(gst::StreamFlags::SELECT) {
-                            if let Some(id) = stream_id {
+                        if stream.stream_flags().contains(gst::StreamFlags::SELECT)
+                            && let Some(id) = stream_id {
                                 self.selected_stream_ids.push(id.to_string());
                             }
-                        }
                     }
                     _ => {
                         log::debug!("Ignoring stream of type {:?}", stream_type);

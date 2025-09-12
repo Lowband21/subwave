@@ -1,5 +1,7 @@
 pub mod gst_play_flags {
-    use gstreamer::glib::{bitflags, gobject_ffi, prelude::*, translate::*, value::FromValue, Type, Value};
+    use gstreamer::glib::{
+        Type, Value, bitflags, gobject_ffi, prelude::*, translate::*, value::FromValue,
+    };
     use std::fmt;
 
     bitflags::bitflags! {

@@ -1,0 +1,21 @@
+[package]
+name = "subwave_unified"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# expose trait and types
+subwave_core = { path = "../subwave_core" }
+# concrete backends
+subwave_appsink = { path = "../subwave_appsink" }
+subwave_wayland = { path = "../subwave_wayland" }
+
+# UI
+iced.workspace = true
+iced_wgpu.workspace = true
+
+log.workspace = true
+url.workspace = true
+

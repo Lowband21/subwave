@@ -5,14 +5,16 @@ use gstreamer_video::{
     VideoOverlay,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::gstplayflags::gst_play_flags::GstPlayFlags;
 
-use subwave_core::video::types::Position;
 use crate::{Error, Result, WaylandIntegration, WaylandSubsurfaceManager};
+use subwave_core::video::types::Position;
 
 pub struct SubsurfacePipeline {
     speed: f64,
+    pub last_valid_position: Option<Duration>,
     pub pipeline: Arc<gst::Pipeline>,
     subsurface: Arc<WaylandSubsurfaceManager>,
 }
@@ -32,13 +34,16 @@ impl SubsurfacePipeline {
         integration: &WaylandIntegration,
         bounds: (i32, i32, i32, i32),
     ) -> Result<Self> {
+        gst::init()?;
 
         let pipeline = gst::ElementFactory::make("playbin3")
             .name("playbin3")
             .build()
             .map_err(|_| Error::Pipeline("Failed to create playbin3 element".to_string()))?
             .downcast::<gst::Pipeline>()
-            .map_err(|_| Error::Pipeline("Failed to downcast to pipeline from playbin3".to_string()))?;
+            .map_err(|_| {
+                Error::Pipeline("Failed to downcast to pipeline from playbin3".to_string())
+            })?;
 
         pipeline.set_property("uri", uri.as_str());
 
@@ -47,7 +52,8 @@ impl SubsurfacePipeline {
         let video_sink = gst::ElementFactory::make("waylandsink")
             .name("vsink")
             .property("sync", true)
-            .build().map_err(|err| {
+            .build()
+            .map_err(|err| {
                 println!("Failed to build video sink: {}", err);
                 Error::Pipeline("Failed to build video sink".to_string())
             })?;
@@ -119,9 +125,8 @@ impl SubsurfacePipeline {
             video_overlay.handle_events(false);
         }
 
-
         video_sink.set_property("fullscreen", false); // Fullscreen true causes freeze with subsurface
-        //subtitle_sink.set_property("fullscreen", false);
+                                                      //subtitle_sink.set_property("fullscreen", false);
 
         if video_sink.has_property("force-aspect-ratio") {
             video_sink.set_property("force-aspect-ratio", true);
@@ -132,22 +137,29 @@ impl SubsurfacePipeline {
         let videoconvertscale = gst::ElementFactory::make("videoconvertscale")
             .name("vcconvert")
             //.property("force-aspect-ratio", true)
-            .build().map_err(|err| {
+            .build()
+            .map_err(|err| {
                 println!("Failed to build video sink: {}", err);
                 Error::Pipeline("Failed to build video sink".to_string())
             })?;
 
-        vsink_bin.add_many(&[&videoconvertscale, &video_sink])
-            .map_err(|e| Error::Pipeline(format!("Failed to add elements to video-sink bin: {}", e)))?;
-        gst::Element::link_many(&[&videoconvertscale, &video_sink])
+        vsink_bin
+            .add_many([&videoconvertscale, &video_sink])
+            .map_err(|e| {
+                Error::Pipeline(format!("Failed to add elements to video-sink bin: {}", e))
+            })?;
+        gst::Element::link_many([&videoconvertscale, &video_sink])
             .map_err(|e| Error::Pipeline(format!("Failed to link video-sink chain: {}", e)))?;
 
         // Create and add a ghost pad so playbin3 can link subtitle stream to this bin
         let ghost_pad = gst::GhostPad::with_target(&videoconvertscale.static_pad("sink").unwrap())
-            .map_err(|e| Error::Pipeline(format!("Failed to create ghost pad for text-sink: {}", e)))?;
+            .map_err(|e| {
+                Error::Pipeline(format!("Failed to create ghost pad for text-sink: {}", e))
+            })?;
 
-        vsink_bin.add_pad(&ghost_pad)
-            .map_err(|e| Error::Pipeline(format!("Failed to add ghost pad to video-sink: {}", e)))?;
+        vsink_bin.add_pad(&ghost_pad).map_err(|e| {
+            Error::Pipeline(format!("Failed to add ghost pad to video-sink: {}", e))
+        })?;
 
         pipeline.set_property("video-sink", vsink_bin);
 
@@ -161,6 +173,7 @@ impl SubsurfacePipeline {
 
         Ok(Self {
             speed: 1.0,
+            last_valid_position: None,
             pipeline: Arc::new(pipeline),
             subsurface: Arc::clone(subsurface),
         })
@@ -354,21 +367,21 @@ impl SubsurfacePipeline {
     pub fn set_render_rectangle(&self, x: i32, y: i32, width: i32, height: i32) {
         if let Some(video_sink) = self.pipeline.by_name("vsink") {
             if let Some(video_overlay) = video_sink.dynamic_cast_ref::<VideoOverlay>() {
-            // Safe to call - this updates where waylandsink renders within the surface
-            if let Err(e) = video_overlay.set_render_rectangle(x, y, width, height) {
-                log::error!("Failed to update render rectangle: {}", e);
-            } else {
-                log::debug!(
-                    "Updated render rectangle to x={}, y={}, w={}, h={}",
-                    x,
-                    y,
-                    width,
-                    height
-                );
+                // Safe to call - this updates where waylandsink renders within the surface
+                if let Err(e) = video_overlay.set_render_rectangle(x, y, width, height) {
+                    log::error!("Failed to update render rectangle: {}", e);
+                } else {
+                    log::debug!(
+                        "Updated render rectangle to x={}, y={}, w={}, h={}",
+                        x,
+                        y,
+                        width,
+                        height
+                    );
+                }
+                video_overlay.expose();
+                video_overlay.handle_events(true); // Still don't know what this does or if it's necessary
             }
-            video_overlay.expose();
-            video_overlay.handle_events(true); // Still don't know what this does or if it's necessary
-        }
         }
         // Keep Wayland subtitle surface in sync with the draw area (no viewport fiddling)
         self.subsurface.set_size(width, height);

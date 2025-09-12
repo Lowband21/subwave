@@ -1,19 +1,16 @@
-use subwave_core::gstplayflags::gst_play_flags::GstPlayFlags;
-use subwave_core::video::types::{AudioTrack, Position, SubtitleTrack, VideoProperties};
-use subwave_core::video::video_trait::Video;
-use subwave_core::Error;
 use crate::internal::Internal;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use gstreamer_video as gst_video;
 use iced::widget::image as img;
 use std::num::NonZeroU8;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-
+use subwave_core::Error;
+use subwave_core::video::types::{AudioTrack, Position, SubtitleTrack, VideoProperties};
+use subwave_core::video::video_trait::Video;
 
 /// A multimedia video loaded from a URI (e.g., a local file path or HTTP stream).
 #[derive(Debug)]
@@ -23,7 +20,6 @@ impl AppsinkVideo {
     /// Creates a video sink bin with proper buffering for network streams
     fn build_video_sink() -> Result<gst::Element, Error> {
         let bin = gst::Bin::builder().name("video-sink-bin").build();
-
 
         // Create the video processing elements
         //let videobalance = gst::ElementFactory::make("videobalance")
@@ -52,7 +48,7 @@ impl AppsinkVideo {
                 "caps",
                 gst::Caps::builder("video/x-raw")
                     .field("format", gst::List::new(["NV12"]))
-                    .field("pixel-aspect-ratio", gst::Fraction::new(1,1))
+                    .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
                     .build(),
             )
             .build()
@@ -62,18 +58,16 @@ impl AppsinkVideo {
             })?;
 
         // Add elements to bin
-        bin.add_many([&videoconvertscale, &appsink])
-            .map_err(|e| {
-                log::error!("Failed to add elements to bin: {:?}", e);
-                Error::Cast
-            })?;
+        bin.add_many([&videoconvertscale, &appsink]).map_err(|e| {
+            log::error!("Failed to add elements to bin: {:?}", e);
+            Error::Cast
+        })?;
 
         // Link elements - convert first, then scale, then balance
-        gst::Element::link_many([&videoconvertscale, &appsink])
-            .map_err(|e| {
-                log::error!("Failed to link elements: {:?}", e);
-                Error::Cast
-            })?;
+        gst::Element::link_many([&videoconvertscale, &appsink]).map_err(|e| {
+            log::error!("Failed to link elements: {:?}", e);
+            Error::Cast
+        })?;
 
         // Create ghost pad
         let sink_pad = videoconvertscale.static_pad("sink").ok_or_else(|| {
@@ -176,8 +170,8 @@ impl AppsinkVideo {
         // Try to get initial caps if available
         if let Some(caps) = pad.current_caps() {
             log::debug!("Initial caps available: {:?}", caps);
-            if let Some(s) = caps.structure(0) {
-                if let (Ok(w), Ok(h), Ok(fr)) = (
+            if let Some(s) = caps.structure(0)
+                && let (Ok(w), Ok(h), Ok(fr)) = (
                     s.get::<i32>("width"),
                     s.get::<i32>("height"),
                     s.get::<gst::Fraction>("framerate"),
@@ -192,7 +186,6 @@ impl AppsinkVideo {
                         framerate
                     );
                 }
-            }
         } else {
             log::debug!("No initial caps available, will update on first sample");
         }
@@ -266,12 +259,12 @@ impl AppsinkVideo {
                         };
 
                     // Update video properties from the first sample with caps
-                    if !caps_checked {
-                        if let Some(caps) = sample.caps() {
+                    if !caps_checked
+                        && let Some(caps) = sample.caps() {
                             log::debug!("Got caps from sample: {:?}", caps);
 
-                            if let Some(s) = caps.structure(0) {
-                                if let (Ok(w), Ok(h), Ok(fr)) = (
+                            if let Some(s) = caps.structure(0)
+                                && let (Ok(w), Ok(h), Ok(fr)) = (
                                     s.get::<i32>("width"),
                                     s.get::<i32>("height"),
                                     s.get::<gst::Fraction>("framerate"),
@@ -300,10 +293,8 @@ impl AppsinkVideo {
                                     drop(frame_guard);
                                     drop(props);
                                 }
-                            }
                             caps_checked = true;
                         }
-                    }
 
                     *last_frame_time_ref
                         .lock()
@@ -372,7 +363,6 @@ impl AppsinkVideo {
 
             stream_collection: None,
             selected_stream_ids: Vec::new(),
-
             //hdr_metadata: hdr_metadata_shared
             //    .lock()
             //    .ok()
@@ -445,7 +435,6 @@ impl AppsinkVideo {
 
         out
     }
-
 }
 
 impl Video for AppsinkVideo {
@@ -459,20 +448,19 @@ impl Video for AppsinkVideo {
         //let is_network_stream = uri.scheme() == "http" || uri.scheme() == "https";
 
         // Create video sink bin
-        let video_sink_bin =
-            match Self::build_video_sink() {
-                Ok(sink) => sink,
-                Err(e) => {
-                    log::error!(
-                        "Failed to create buffered sink, falling back to string pipeline builder: {:?}",
-                        e
-                    );
-                    gst::parse::bin_from_description(
+        let video_sink_bin = match Self::build_video_sink() {
+            Ok(sink) => sink,
+            Err(e) => {
+                log::error!(
+                    "Failed to create buffered sink, falling back to string pipeline builder: {:?}",
+                    e
+                );
+                gst::parse::bin_from_description(
                         "videoconvertscale n-threads=0 ! appsink name=iced_video drop=true caps=\"video/x-raw,format=(string){NV12},pixel-aspect-ratio=1/1\"",
                         true
                     )?.upcast()
-                }
-            };
+            }
+        };
 
         let pipeline = gst::ElementFactory::make("playbin3")
             .property("uri", uri.as_str())
@@ -480,7 +468,6 @@ impl Video for AppsinkVideo {
             .build()?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;
-
 
         // Add scaletempo for pitch correction during variable playback speed
         if let Ok(scaletempo) = gst::ElementFactory::make("scaletempo")
@@ -493,12 +480,19 @@ impl Video for AppsinkVideo {
             log::warn!("scaletempo element not available - pitch correction disabled");
         }
 
-        let video_sink: gst::Element = pipeline.property("video-sink");
+        let video_sink_opt: Option<gst::Element> = pipeline.property("video-sink");
+        let video_sink = match video_sink_opt {
+            Some(e) => e,
+            None => {
+                log::error!("video-sink property is None on pipeline");
+                return Err(Error::Cast);
+            }
+        };
         let video_sink_bin = video_sink.downcast::<gst::Bin>().map_err(|_| {
             log::error!("Failed to downcast video-sink to Bin");
             Error::Cast
         })?;
-        let video_sink = video_sink_bin.by_name("iced_video").ok_or_else(|| {
+        let video_sink = video_sink_bin.by_name("subwave_appsink").ok_or_else(|| {
             log::error!("Failed to find 'iced_video' element in video sink bin");
             Error::Cast
         })?;
@@ -637,14 +631,16 @@ impl Video for AppsinkVideo {
 
     /// Get the current subtitle URL.
     fn subtitle_url(&self) -> Option<url::Url> {
-        url::Url::parse(&self.read().source.property::<String>("suburi")).ok()
+        self.read()
+            .source
+            .property::<Option<String>>("suburi")
+            .and_then(|s| url::Url::parse(&s).ok())
     }
 
     /// Get the underlying GStreamer pipeline.
     fn pipeline(&self) -> gst::Pipeline {
         self.read().source.clone()
     }
-
 
     /// Get the list of available subtitle tracks
     fn subtitle_tracks(&mut self) -> Vec<SubtitleTrack> {

@@ -1,17 +1,15 @@
 use crate::{render_pipeline::VideoPrimitive, video::AppsinkVideo};
 use gstreamer::{self as gst, glib};
 use iced::{
-    advanced::{self, layout, widget, Widget}, wgpu::TextureFormat, Element
+    Element,
+    advanced::{self, Widget, layout, widget},
+    wgpu::TextureFormat,
 };
 use iced_wgpu::primitive::Renderer as PrimitiveRenderer;
 use log::error;
-use subwave_core::video::video_trait::Video;
 use std::sync::Arc;
-use std::{
-    marker::PhantomData,
-    sync::atomic::Ordering,
-    time::Instant,
-};
+use std::{marker::PhantomData, sync::atomic::Ordering, time::Instant};
+use subwave_core::video::video_trait::Video;
 
 /// Video player widget which displays the current frame of a [`Video`](crate::Video).
 pub struct VideoPlayer<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer>
@@ -212,8 +210,10 @@ where
                     Arc::clone(&inner.frame),
                     dims,
                     upload_frame,
-                    TextureFormat::Rgba8Unorm,
-                )
+                    // Use the same format as the surface; iced will pass it to our prepare()
+                    // This argument is ignored by our pipeline creation and replaced with actual surface format
+                    TextureFormat::Bgra8UnormSrgb,
+                ),
             );
         };
 
@@ -395,7 +395,7 @@ where
                     static mut STATS_COUNTER: u64 = 0;
                     unsafe {
                         STATS_COUNTER += 1;
-                        if STATS_COUNTER % 60 == 0 {
+                        if STATS_COUNTER.is_multiple_of(60) {
                             // Every ~60 frames (roughly 1-2 seconds)
                             inner.update_connection_stats();
                         }

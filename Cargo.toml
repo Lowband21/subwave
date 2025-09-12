@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["subwave_appsink","subwave_core","subwave_wayland"]
+members = ["subwave_appsink","subwave_core","subwave_wayland","subwave_unified"]
 
 [workspace.package]
 version = "0.1.0"

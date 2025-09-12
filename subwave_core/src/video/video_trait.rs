@@ -1,7 +1,10 @@
-use std::time::Duration;
 use gstreamer as gst;
+use std::time::Duration;
 
-use crate::{video::types::{AudioTrack, Position, SubtitleTrack}, Error};
+use crate::{
+    Error,
+    video::types::{AudioTrack, Position, SubtitleTrack},
+};
 
 pub trait Video {
     type Video: Video;

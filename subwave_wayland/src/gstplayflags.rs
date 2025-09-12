@@ -1,5 +1,7 @@
 pub mod gst_play_flags {
-    use gstreamer::glib::{bitflags, gobject_ffi, prelude::*, translate::*, value::FromValue, Type, Value, value};
+    use gstreamer::glib::{
+        bitflags, gobject_ffi, prelude::*, translate::*, value, value::FromValue, Type, Value,
+    };
     use std::fmt;
 
     bitflags::bitflags! {
@@ -139,11 +141,7 @@ pub mod gst_play_flags {
         }
 
         pub fn network_no_subs() -> Self {
-            Self::VIDEO
-                | Self::AUDIO
-                | Self::SOFT_VOLUME
-                | Self::BUFFERING
-                | Self::DEINTERLACE
+            Self::VIDEO | Self::AUDIO | Self::SOFT_VOLUME | Self::BUFFERING | Self::DEINTERLACE
         }
 
         /// Get flags for video playback without text

@@ -3504,6 +3504,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "subwave_unified"
+version = "0.1.0"
+dependencies = [
+ "iced",
+ "iced_wgpu",
+ "log",
+ "subwave_appsink",
+ "subwave_core",
+ "subwave_wayland",
+ "url",
+]
+
+[[package]]
 name = "subwave_wayland"
 version = "0.1.0"
 dependencies = [

@@ -139,8 +139,8 @@ where
                     // and enough time has passed since last update (100ms throttling)
                     if video.is_playing() {
                         // Check if 100ms has passed since last position update
-                        let should_update = video
-                            .should_emit_on_new_frame(std::time::Duration::from_millis(1000));
+                        let should_update =
+                            video.should_emit_on_new_frame(std::time::Duration::from_millis(1000));
 
                         // Emit new frame message if configured and timing is right
                         // This allows the player to update position/duration
@@ -237,34 +237,16 @@ where
                         let new_width = widget_width.round() as i32;
                         let new_height = widget_height.round() as i32;
 
-                        // Only update if size actually changed and dimensions are valid
                         if current_size != (new_width, new_height)
                             && new_width > 0
                             && new_height > 0
                         {
                             log::info!("Setting new size to {}, {}", new_width, new_height);
-                            // Update background subsurface to match widget size
                             subsurface.update_background(new_width, new_height);
-
-                            // Update video subsurface to match widget size
                             subsurface.set_size(new_width, new_height);
-
-                            // Update render rectangle to match widget (gstreamer handles scaling and aspect ratio)
                             video.set_video_size_position(0, 0, new_width, new_height);
-
-                            //subsurface.set_video_surface_opaque_region(
-                            //    0,
-                            //    0,
-                            //    video_width,
-                            //    video_height,
-                            //);
-
-                            // TODO: Implement proper damage and commit handling
                             subsurface.integration.trigger_pre_commit_hooks();
-
                             subsurface.force_damage_and_commit();
-
-                            // TODO: Determine correct flush behavior
                             match subsurface.flush() {
                                 Ok(_) => (),
                                 Err(e) => log::debug!("Error: {:#?}", e),
@@ -272,7 +254,13 @@ where
                         }
 
                         // Pump updates (bus commands + subtitles) from the UI thread each draw
-                        video.tick();
+                        // We need a mutable reference to call tick()
+                        drop(guard);
+                        if let Ok(mut guard2) = self.video.lock() {
+                            if let Some(video_mut) = guard2.as_deref_mut() {
+                                video_mut.tick();
+                            }
+                        }
                     }
                 }
             }

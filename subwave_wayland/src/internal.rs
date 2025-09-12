@@ -1,9 +1,16 @@
-use std::{sync::{atomic::AtomicBool, Arc}, thread::JoinHandle, time::{Duration, Instant}};
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use gstreamer::StreamCollection;
-use std::sync::mpsc;
 use parking_lot::Mutex;
-use subwave_core::video::types::{AudioTrack, SubtitleTrack, VideoProperties};
+use std::sync::mpsc;
+use subwave_core::{
+    types::PendingState,
+    video::types::{AudioTrack, SubtitleTrack, VideoProperties},
+};
 
 use crate::{pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
 
@@ -13,7 +20,7 @@ pub(crate) struct Internal {
     pub(crate) uri: url::Url,
 
     // Core handles
-    pub(crate) pipeline: Option<Arc<SubsurfacePipeline>>,     // read-mostly; clone and drop lock before external calls
+    pub(crate) pipeline: Option<Arc<SubsurfacePipeline>>, // read-mostly; clone and drop lock before external calls
     pub(crate) subsurface: Option<Arc<WaylandSubsurfaceManager>>, // same
 
     pub(crate) video_props: Option<Arc<Mutex<VideoProperties>>>,
@@ -48,6 +55,9 @@ pub(crate) struct Internal {
     pub(crate) subtitle_index_to_stream_id: Vec<String>,
 
     pub(crate) selected_stream_ids: Vec<String>,
+
+    // Pending playback state to apply when pipeline is ready
+    pub(crate) pending_state: Option<PendingState>,
 
     // Throttling
     pub(crate) last_position_update: Instant,

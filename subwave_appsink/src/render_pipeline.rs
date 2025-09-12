@@ -2,11 +2,11 @@ use iced::wgpu::TextureFormat;
 use iced_wgpu::primitive::Primitive;
 use iced_wgpu::wgpu;
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{BTreeMap, btree_map::Entry},
     num::NonZero,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -53,7 +53,6 @@ struct VideoEntry {
     alive: Arc<AtomicBool>,
     //pixel_format: VideoPixelFormat,
     //tone_mapping_config: ToneMappingConfig,
-
     prepare_index: AtomicUsize,
     render_index: AtomicUsize,
 }
@@ -215,16 +214,21 @@ impl VideoRenderPipeline {
         //tone_mapping_config: &ToneMappingConfig,
     ) {
         if let Entry::Vacant(entry) = self.videos.entry(video_id) {
-            //let y_format = pixel_format.y_texture_format(device);
-            //let uv_format = pixel_format.uv_texture_format(device);
-            //log::info!(
-            //    "Creating textures with formats: Y={:?}, UV={:?}",
-            //    y_format,
-            //    uv_format
-            //);
+            // For now we assume NV12 input from appsink: Y plane (R8) and interleaved UV plane (RG8)
+            // In the future, detect caps and pick from pixel_format.rs
+            let y_format = wgpu::TextureFormat::R8Unorm;
+            let uv_format = wgpu::TextureFormat::Rg8Unorm;
+
+            log::debug!(
+                "Creating textures for NV12: Y={:?}, UV={:?}, frame={}x{}",
+                y_format,
+                uv_format,
+                width,
+                height
+            );
 
             let texture_y = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("subwave texture"),
+                label: Some("subwave texture Y (R8)"),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -233,13 +237,13 @@ impl VideoRenderPipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format,
+                format: y_format,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
 
             let texture_uv = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("subwave texture"),
+                label: Some("subwave texture UV (RG8)"),
                 size: wgpu::Extent3d {
                     width: width / 2,
                     height: height / 2,
@@ -248,7 +252,7 @@ impl VideoRenderPipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format,
+                format: uv_format,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
@@ -346,7 +350,6 @@ impl VideoRenderPipeline {
                 alive: Arc::clone(alive),
                 //pixel_format,
                 //tone_mapping_config: tone_mapping_config.clone(),
-
                 prepare_index: AtomicUsize::new(0),
                 render_index: AtomicUsize::new(0),
             });
@@ -358,6 +361,7 @@ impl VideoRenderPipeline {
             ..
         } = self.videos.get(&video_id).unwrap();
 
+        // Write Y plane (R8), bytes_per_row = width bytes
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: texture_y,
@@ -378,6 +382,7 @@ impl VideoRenderPipeline {
             },
         );
 
+        // Write interleaved UV plane (RG8), bytes_per_row = (width/2) * 2 = width
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: texture_uv,

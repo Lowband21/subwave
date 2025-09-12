@@ -1,3 +1,5 @@
+pub mod gstplayflags;
+pub mod internal;
 mod pipeline;
 mod position;
 pub mod subsurface_manager;
@@ -5,14 +7,12 @@ mod video;
 mod video_player;
 mod wayland_integration;
 pub mod window;
-pub mod gstplayflags;
-pub mod internal;
 
 pub use subsurface_manager::WaylandSubsurfaceManager;
+pub use subwave_core::Error;
 pub use video::SubsurfaceVideo;
 pub use video_player::VideoPlayer;
 pub use wayland_integration::WaylandIntegration;
-pub use subwave_core::Error;
 
 pub type Result<T> = std::result::Result<T, subwave_core::Error>;
 

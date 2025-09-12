@@ -1,6 +1,18 @@
-use std::time::Duration;
 use gstreamer as gst;
+use std::time::Duration;
 
+#[derive(Clone, Debug)]
+pub struct PendingState {
+    pub paused: bool,
+    pub position: Duration,
+    pub speed: f64,
+    pub volume: f64,
+    pub muted: bool,
+    pub audio_track: i32,
+    pub subtitle_track: Option<i32>,
+    pub subtitles_enabled: bool,
+    pub subtitle_url: Option<url::Url>,
+}
 
 #[derive(Debug, Clone)]
 pub struct VideoProperties {
