@@ -134,6 +134,21 @@ impl SubsurfacePipeline {
 
         let vsink_bin = gst::Bin::new();
 
+        // Insert a buffering queue to decouple upstream reconfiguration when subtitles are enabled
+        let queue2 = gst::ElementFactory::make("queue2")
+            .name("video-buffer")
+            .property("use-buffering", true)
+            .property("low-percent", 20i32)
+            .property("high-percent", 80i32)
+            .property("max-size-buffers", 0u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 5_000_000_000u64) // 5s
+            .build()
+            .map_err(|err| {
+                println!("Failed to build video buffer queue2: {}", err);
+                Error::Pipeline("Failed to build queue2 for video sink".to_string())
+            })?;
+
         let videoconvertscale = gst::ElementFactory::make("videoconvertscale")
             .name("vcconvert")
             //.property("force-aspect-ratio", true)
@@ -144,15 +159,15 @@ impl SubsurfacePipeline {
             })?;
 
         vsink_bin
-            .add_many([&videoconvertscale, &video_sink])
+            .add_many([&queue2, &videoconvertscale, &video_sink])
             .map_err(|e| {
                 Error::Pipeline(format!("Failed to add elements to video-sink bin: {}", e))
             })?;
-        gst::Element::link_many([&videoconvertscale, &video_sink])
+        gst::Element::link_many([&queue2, &videoconvertscale, &video_sink])
             .map_err(|e| Error::Pipeline(format!("Failed to link video-sink chain: {}", e)))?;
 
-        // Create and add a ghost pad so playbin3 can link subtitle stream to this bin
-        let ghost_pad = gst::GhostPad::with_target(&videoconvertscale.static_pad("sink").unwrap())
+        // Create and add a ghost pad so playbin3 can link video into this bin through the buffer
+        let ghost_pad = gst::GhostPad::with_target(&queue2.static_pad("sink").unwrap())
             .map_err(|e| {
                 Error::Pipeline(format!("Failed to create ghost pad for text-sink: {}", e))
             })?;

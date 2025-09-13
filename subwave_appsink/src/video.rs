@@ -21,14 +21,21 @@ impl AppsinkVideo {
     fn build_video_sink() -> Result<gst::Element, Error> {
         let bin = gst::Bin::builder().name("video-sink-bin").build();
 
-        // Create the video processing elements
-        //let videobalance = gst::ElementFactory::make("videobalance")
-        //    .name("video_balance")
-        //    .build()
-        //    .map_err(|e| {
-        //        log::error!("Failed to create videobalance: {:?}", e);
-        //        Error::Cast
-        //    })?;
+        // Insert a buffering queue to decouple upstream reconfiguration (e.g., enabling subtitles)
+        // and avoid stalling video/audio during dynamic re-negotiation.
+        let queue2 = gst::ElementFactory::make("queue2")
+            .name("video-buffer")
+            .property("use-buffering", true)
+            .property("low-percent", 20i32)
+            .property("high-percent", 80i32)
+            .property("max-size-buffers", 0u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 5_000_000_000u64) // 5s
+            .build()
+            .map_err(|e| {
+                log::error!("Failed to create queue2: {:?}", e);
+                Error::Cast
+            })?;
 
         let videoconvertscale = gst::ElementFactory::make("videoconvertscale")
             .property("n-threads", 0u32) // Use multiple threads for conversion
@@ -58,20 +65,20 @@ impl AppsinkVideo {
             })?;
 
         // Add elements to bin
-        bin.add_many([&videoconvertscale, &appsink]).map_err(|e| {
+        bin.add_many([&queue2, &videoconvertscale, &appsink]).map_err(|e| {
             log::error!("Failed to add elements to bin: {:?}", e);
             Error::Cast
         })?;
 
-        // Link elements - convert first, then scale, then balance
-        gst::Element::link_many([&videoconvertscale, &appsink]).map_err(|e| {
+        // Link elements: queue2 -> convert/scale -> appsink
+        gst::Element::link_many([&queue2, &videoconvertscale, &appsink]).map_err(|e| {
             log::error!("Failed to link elements: {:?}", e);
             Error::Cast
         })?;
 
-        // Create ghost pad
-        let sink_pad = videoconvertscale.static_pad("sink").ok_or_else(|| {
-            log::error!("Failed to get sink pad from videoconvertscale");
+        // Create ghost pad targeting the queue2 sink so upstream can feed into the buffer
+        let sink_pad = queue2.static_pad("sink").ok_or_else(|| {
+            log::error!("Failed to get sink pad from queue2");
             Error::Cast
         })?;
 

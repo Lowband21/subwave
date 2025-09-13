@@ -118,9 +118,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.set_paused(paused),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        v.set_paused(paused);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    v.set_paused(paused);
+                }
             }
         }
     }
@@ -130,9 +131,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.paused(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.paused();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.paused();
+                }
                 true
             }
         }
@@ -151,9 +153,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.set_speed(speed),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        return v.set_speed(speed);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    return v.set_speed(speed);
+                }
                 Ok(())
             }
         }
@@ -164,9 +167,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.position(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.position();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.position();
+                }
                 Duration::ZERO
             }
         }
@@ -177,9 +181,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.duration(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.duration();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.duration();
+                }
                 Duration::ZERO
             }
         }
@@ -190,9 +195,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.seek(position, accurate),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        return v.seek(position, accurate);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    return v.seek(position, accurate);
+                }
                 Err(subwave_core::Error::InvalidState)
             }
         }
@@ -203,9 +209,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.set_volume(volume),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        v.set_volume(volume);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    v.set_volume(volume);
+                }
             }
         }
     }
@@ -215,9 +222,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.volume(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.volume();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.volume();
+                }
                 1.0
             }
         }
@@ -228,9 +236,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.set_muted(muted),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        v.set_muted(muted);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    v.set_muted(muted);
+                }
             }
         }
     }
@@ -240,9 +249,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.has_video(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.has_video();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.has_video();
+                }
                 false
             }
         }
@@ -254,9 +264,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.size(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.size();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.size();
+                }
                 (0, 0)
             }
         }
@@ -268,9 +279,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.audio_tracks(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        return v.audio_tracks();
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    return v.audio_tracks();
+                }
                 vec![]
             }
         }
@@ -281,9 +293,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.current_audio_track(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.current_audio_track();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.current_audio_track();
+                }
                 0
             }
         }
@@ -294,9 +307,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.select_audio_track(index),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        return v.select_audio_track(index);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    return v.select_audio_track(index);
+                }
                 Err(subwave_core::Error::InvalidState)
             }
         }
@@ -307,9 +321,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.subtitle_tracks(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        return v.subtitle_tracks();
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    return v.subtitle_tracks();
+                }
                 vec![]
             }
         }
@@ -320,9 +335,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.current_subtitle_track(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.current_subtitle_track();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.current_subtitle_track();
+                }
                 None
             }
         }
@@ -333,9 +349,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.select_subtitle_track(index),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        return v.select_subtitle_track(index);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    return v.select_subtitle_track(index);
+                }
                 Err(subwave_core::Error::InvalidState)
             }
         }
@@ -346,9 +363,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.subtitles_enabled(),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(g) = handle.lock()
-                    && let Some(v) = g.as_ref() {
-                        return v.subtitles_enabled();
-                    }
+                    && let Some(v) = g.as_ref()
+                {
+                    return v.subtitles_enabled();
+                }
                 false
             }
         }
@@ -359,9 +377,10 @@ impl SubwaveVideo {
             SubwaveVideo::Appsink { inner, .. } => inner.set_subtitles_enabled(enabled),
             SubwaveVideo::Wayland { handle, .. } => {
                 if let Ok(mut g) = handle.lock()
-                    && let Some(ref mut v) = g.as_mut() {
-                        v.set_subtitles_enabled(enabled);
-                    }
+                    && let Some(ref mut v) = g.as_mut()
+                {
+                    v.set_subtitles_enabled(enabled);
+                }
             }
         }
     }
@@ -392,35 +411,36 @@ impl SubwaveVideo {
             } => {
                 // Attempt to apply any pending state if the pipeline is ready
                 if let Ok(mut pending_guard) = pending.lock()
-                    && let Some(state) = pending_guard.take() {
-                        if let Ok(mut h) = handle.lock() {
-                            if let Some(ref mut v) = h.as_mut() {
-                                // Only apply if video has started producing frames
-                                if v.has_video() {
-                                    let _ = v.set_speed(state.speed);
-                                    v.set_volume(state.volume);
-                                    v.set_muted(state.muted);
-                                    let _ = v.select_audio_track(state.audio_track);
-                                    let _ = v.select_subtitle_track(state.subtitle_track);
-                                    v.set_subtitles_enabled(state.subtitles_enabled);
-                                    if let Some(url) = state.subtitle_url {
-                                        let _ = v.set_subtitle_url(&url);
-                                    }
-                                    let _ = v.seek(state.position, false);
-                                    v.set_paused(state.paused);
-                                } else {
-                                    // Not ready yet - put it back
-                                    *pending_guard = Some(state);
+                    && let Some(state) = pending_guard.take()
+                {
+                    if let Ok(mut h) = handle.lock() {
+                        if let Some(ref mut v) = h.as_mut() {
+                            // Only apply if video has started producing frames
+                            if v.has_video() {
+                                let _ = v.set_speed(state.speed);
+                                v.set_volume(state.volume);
+                                v.set_muted(state.muted);
+                                let _ = v.select_audio_track(state.audio_track);
+                                let _ = v.select_subtitle_track(state.subtitle_track);
+                                v.set_subtitles_enabled(state.subtitles_enabled);
+                                if let Some(url) = state.subtitle_url {
+                                    let _ = v.set_subtitle_url(&url);
                                 }
+                                let _ = v.seek(state.position, false);
+                                v.set_paused(state.paused);
                             } else {
-                                // No inner video yet - put it back
+                                // Not ready yet - put it back
                                 *pending_guard = Some(state);
                             }
                         } else {
-                            // Failed to lock - put it back
+                            // No inner video yet - put it back
                             *pending_guard = Some(state);
                         }
+                    } else {
+                        // Failed to lock - put it back
+                        *pending_guard = Some(state);
                     }
+                }
 
                 let mut w = subwave_wayland::VideoPlayer::new(handle)
                     .width(Length::Fill)
@@ -523,8 +543,12 @@ impl SubwaveVideo {
         // Pause before applying state to ensure seeks land correctly
         inner.set_paused(true);
         let _ = inner.select_audio_track(st.audio_track);
-        let _ = inner.select_subtitle_track(st.subtitle_track);
-        inner.set_subtitles_enabled(st.subtitles_enabled);
+        let target_sub = if st.subtitles_enabled {
+            st.subtitle_track
+        } else {
+            None
+        };
+        let _ = inner.select_subtitle_track(target_sub);
         if let Some(url) = &st.subtitle_url {
             let _ = inner.set_subtitle_url(url);
         }
