@@ -47,7 +47,7 @@ pub(crate) struct Internal {
 
     // Connection monitoring
     pub(crate) current_bitrate: u64, // bits per second
-    pub(crate) avg_in_rate: u64,     // average input rate from queue2
+    pub(crate) avg_in_rate: i64,     // average input rate from queue2
 
     // Error recovery
     pub(crate) last_error_time: Option<Instant>,
@@ -253,6 +253,7 @@ impl Internal {
             return;
         };
         if let Ok(video_sink_bin) = video_sink.dynamic_cast::<gst::Bin>()
+<<<<<<< HEAD
             && let Some(buffer) = video_sink_bin.by_name("video-buffer") {
                 // Check if this is actually a queue2 element that has the properties we need
                 if buffer.has_property("avg-in-rate") {
@@ -262,13 +263,52 @@ impl Internal {
                         self.avg_in_rate = avg_in;
                         log::trace!("Queue2 average input rate: {} bytes/sec", avg_in);
                     }
+||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
+            && let Some(buffer) = video_sink_bin.by_name("video-buffer")
+        {
+            // Check if this is actually a queue2 element that has the properties we need
+            if buffer.has_property("avg-in-rate") {
+                // Get average input rate
+                let avg_in: u64 = buffer.property("avg-in-rate");
+                if avg_in > 0 {
+                    self.avg_in_rate = avg_in;
+                    log::trace!("Queue2 average input rate: {} bytes/sec", avg_in);
+                }
+=======
+            && let Some(buffer) = video_sink_bin.by_name("video-buffer")
+        {
+            // Check if this is actually a queue2 element that has the properties we need
+            if buffer.has_property("avg-in-rate") {
+                // Get average input rate (queue2 exposes it as gint64)
+                let avg_in_signed: i64 = buffer.property("avg-in-rate");
+                if avg_in_signed > 0 {
+                    let avg_in = avg_in_signed;
+                    self.avg_in_rate = avg_in;
+                    log::trace!("Queue2 average input rate: {} bytes/sec", avg_in);
+                }
+>>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
 
+<<<<<<< HEAD
                     // Get current level bytes for monitoring
                     if buffer.has_property("current-level-bytes") {
                         let current_level: u64 = buffer.property("current-level-bytes");
                         log::trace!("Queue2 current buffer level: {} bytes", current_level);
                     }
+||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
+                // Get current level bytes for monitoring
+                if buffer.has_property("current-level-bytes") {
+                    let current_level: u64 = buffer.property("current-level-bytes");
+                    log::trace!("Queue2 current buffer level: {} bytes", current_level);
+                }
+=======
+                // Get current level bytes for monitoring
+                if buffer.has_property("current-level-bytes") {
+                    let current_level: u32 = buffer.property("current-level-bytes");
+                    log::trace!("Queue2 current buffer level: {} bytes", current_level);
+                }
+>>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
 
+<<<<<<< HEAD
                     // Update connection speed on playbin based on measured rate
                     if self.avg_in_rate > 0 {
                         // Convert bytes/sec to bits/sec
@@ -278,6 +318,21 @@ impl Internal {
                     }
                 } else {
                     log::trace!("Buffer element is not queue2, skipping stats update");
+||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
+                // Update connection speed on playbin based on measured rate
+                if self.avg_in_rate > 0 {
+                    // Convert bytes/sec to bits/sec
+                    let bits_per_sec = self.avg_in_rate * 8;
+                    self.source.set_property("connection-speed", bits_per_sec);
+                    self.current_bitrate = bits_per_sec;
+=======
+                // Update connection speed on playbin based on measured rate
+                if self.avg_in_rate > 0 {
+                    // Convert bytes/sec to bits/sec
+                    let bits_per_sec: u64 = self.avg_in_rate.saturating_mul(8) as u64;
+                    self.source.set_property("connection-speed", bits_per_sec);
+                    self.current_bitrate = bits_per_sec;
+>>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
                 }
             }
     }
@@ -362,9 +417,9 @@ impl Internal {
         }
     }
 
-    /// Query available subtitle tracks
+    // TODO: Add fallback stream collection query?
+    /// Return available subtitles
     pub(crate) fn query_subtitle_tracks(&mut self) -> Vec<SubtitleTrack> {
-        // For playbin3, tracks are already populated via stream collection
         if !self.available_subtitles.is_empty() {
             log::info!(
                 "Returning {} subtitle tracks from stream collection",
@@ -373,9 +428,8 @@ impl Internal {
             return self.available_subtitles.clone();
         }
 
-        // Fallback to old method for compatibility (shouldn't happen with playbin3)
-        log::warn!("No subtitle tracks in stream collection, falling back to old method");
-        self.available_subtitles.clone()
+        log::warn!("No subtitle tracks in stream collection, returning empty");
+        Vec::new()
     }
 
     /// Select a specific subtitle track

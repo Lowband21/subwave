@@ -378,7 +378,7 @@ impl SubsurfaceVideo {
                     }
 
                     while !stop.load(Ordering::SeqCst) {
-                        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
+                        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) {
                             match msg.view() {
                                 MessageView::Eos(_) => {
                                     // Mark EOS and schedule restart on UI thread if looping

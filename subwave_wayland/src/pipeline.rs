@@ -38,6 +38,16 @@ impl SubsurfacePipeline {
 
         let pipeline = gst::ElementFactory::make("playbin3")
             .name("playbin3")
+            .property("message-forward", true)
+            .property("async-handling", true)
+            //.property("connection-speed", 500000u64)
+            // CRITICAL NOTE: Must be larger than video-sink-bin's queue2 buffer
+            //.property("buffer-duration", 10_000_000_000i64) // 5s
+            //.property("buffer-size", 3_000_000i32)
+            .property("buffer-duration", 6_000_000_000i64) // 5s
+            //.property("buffer-size", 6_000_000i32)
+            .property("ring-buffer-max-size", 536870912u64)
+            //.property("delay", 500_000_000u64)
             .build()
             .map_err(|_| Error::Pipeline("Failed to create playbin3 element".to_string()))?
             .downcast::<gst::Pipeline>()
@@ -47,11 +57,20 @@ impl SubsurfacePipeline {
 
         pipeline.set_property("uri", uri.as_str());
 
+<<<<<<< HEAD
         pipeline.set_property("flags", GstPlayFlags::network_no_subs());
+||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
+        pipeline.set_property("flags", GstPlayFlags::for_network_stream());
+=======
+        pipeline.set_property("flags", GstPlayFlags::wayland_native());
+>>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
 
         let video_sink = gst::ElementFactory::make("waylandsink")
             .name("vsink")
+            .property("async", true)
             .property("sync", true)
+            // Setting too high causes stuttering, will have adjust dynamically to optimize
+            //.property("blocksize", 500_000u32)
             .build()
             .map_err(|err| {
                 println!("Failed to build video sink: {}", err);
@@ -80,8 +99,6 @@ impl SubsurfacePipeline {
                     value.to_glib_none_mut().0,
                     integration.display,
                 );
-
-                //video_sink.set_property("display", &value);
 
                 gst_ffi::gst_structure_set_value(
                     structure.as_ptr() as *mut gst_ffi::GstStructure,
@@ -114,7 +131,6 @@ impl SubsurfacePipeline {
             .ok_or_else(|| Error::Pipeline("waylandsink doesn't implement VideoOverlay".into()))?;
 
         unsafe {
-            // video_overlay.prepare_window_handle();
             video_overlay.set_window_handle(surface_handle);
             if let Err(err) =
                 video_overlay.set_render_rectangle(bounds.0, bounds.1, bounds.2, bounds.3)
@@ -126,55 +142,69 @@ impl SubsurfacePipeline {
         }
 
         video_sink.set_property("fullscreen", false); // Fullscreen true causes freeze with subsurface
-                                                      //subtitle_sink.set_property("fullscreen", false);
 
         if video_sink.has_property("force-aspect-ratio") {
-            video_sink.set_property("force-aspect-ratio", true);
+            video_sink.set_property("force-aspect-ratio", false);
         }
 
-        let vsink_bin = gst::Bin::new();
+        let vsink_bin = gst::Bin::with_name("waylandsink-bin");
 
         // Insert a buffering queue to decouple upstream reconfiguration when subtitles are enabled
         let queue2 = gst::ElementFactory::make("queue2")
             .name("video-buffer")
             .property("use-buffering", true)
-            .property("low-percent", 20i32)
-            .property("high-percent", 80i32)
-            .property("max-size-buffers", 0u32)
+            //.property("low-watermark", 0.25f64)
+            //.property("high-watermark", 0.85f64)
+            .property("max-size-buffers", 20u32)
+            //.property("max-size-time", 6_000_000_000u64) // 5s
+            //.property("max-size-bytes", 4_000_000u32)
             .property("max-size-bytes", 0u32)
-            .property("max-size-time", 5_000_000_000u64) // 5s
+            //.property("ring-buffer-max-size", 536870912u64)
+            //.property("use-bitrate-query", true)
+            //.property("use-rate-estimate", true)
             .build()
             .map_err(|err| {
                 println!("Failed to build video buffer queue2: {}", err);
                 Error::Pipeline("Failed to build queue2 for video sink".to_string())
             })?;
 
-        let videoconvertscale = gst::ElementFactory::make("videoconvertscale")
-            .name("vcconvert")
-            //.property("force-aspect-ratio", true)
+        let vapostproc = gst::ElementFactory::make("vapostproc")
+            .name("vapostproc")
+            // Causes significant artifacting
+            .property("add-borders", false)
+            // Fixes washed out hdr
+            .property("disable-passthrough", true)
             .build()
             .map_err(|err| {
                 println!("Failed to build video sink: {}", err);
                 Error::Pipeline("Failed to build video sink".to_string())
             })?;
 
+        // Should enable tone mapping on supported hardware
+        if vapostproc.has_property("hdr-tone-mapping") {
+            vapostproc.set_property("hdr-tone-mapping", true);
+        }
+
         vsink_bin
-            .add_many([&queue2, &videoconvertscale, &video_sink])
+            .add_many([&queue2, &vapostproc, &video_sink])
             .map_err(|e| {
                 Error::Pipeline(format!("Failed to add elements to video-sink bin: {}", e))
             })?;
-        gst::Element::link_many([&queue2, &videoconvertscale, &video_sink])
+        gst::Element::link_many([&queue2, &vapostproc, &video_sink])
             .map_err(|e| Error::Pipeline(format!("Failed to link video-sink chain: {}", e)))?;
 
         // Create and add a ghost pad so playbin3 can link video into this bin through the buffer
-        let ghost_pad = gst::GhostPad::with_target(&queue2.static_pad("sink").unwrap())
-            .map_err(|e| {
+        let ghost_pad =
+            gst::GhostPad::with_target(&queue2.static_pad("sink").unwrap()).map_err(|e| {
                 Error::Pipeline(format!("Failed to create ghost pad for text-sink: {}", e))
             })?;
 
         vsink_bin.add_pad(&ghost_pad).map_err(|e| {
             Error::Pipeline(format!("Failed to add ghost pad to video-sink: {}", e))
         })?;
+
+        vsink_bin.set_property("message_forward", true);
+        vsink_bin.set_property("async-handling", false);
 
         pipeline.set_property("video-sink", vsink_bin);
 
@@ -330,7 +360,7 @@ impl SubsurfacePipeline {
     pub fn seek(&self, position: impl Into<Position>, _accurate: bool) -> Result<()> {
         let position = position.into();
 
-        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT; // | gst::SeekFlags::ACCURATE; // No point accurate seeking for video playback
+        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT; //| gst::SeekFlags::TRICKMODE; // | gst::SeekFlags::ACCURATE; // No point accurate seeking for video playback
 
         // Perform the seek
         match &position {

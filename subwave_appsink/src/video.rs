@@ -23,22 +23,24 @@ impl AppsinkVideo {
 
         // Insert a buffering queue to decouple upstream reconfiguration (e.g., enabling subtitles)
         // and avoid stalling video/audio during dynamic re-negotiation.
-        let queue2 = gst::ElementFactory::make("queue2")
-            .name("video-buffer")
-            .property("use-buffering", true)
-            .property("low-percent", 20i32)
-            .property("high-percent", 80i32)
-            .property("max-size-buffers", 0u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 5_000_000_000u64) // 5s
-            .build()
-            .map_err(|e| {
-                log::error!("Failed to create queue2: {:?}", e);
-                Error::Cast
-            })?;
+        //let queue2 = gst::ElementFactory::make("queue2")
+        //    .name("video-buffer")
+        //    .property("use-buffering", true)
+        //    .property("max-size-time", 3_000_000_000u64) // 5s
+        //    .property("max-size-bytes", 2_000_000u32)
+        //    //.property("low-percent", 20i32)
+        //    //.property("high-percent", 80i32)
+        //    //.property("max-size-buffers", 0u32)
+        //    .build()
+        //    .map_err(|e| {
+        //        log::error!("Failed to create queue2: {:?}", e);
+        //        Error::Cast
+        //    })?;
 
         let videoconvertscale = gst::ElementFactory::make("videoconvertscale")
             .property("n-threads", 0u32) // Use multiple threads for conversion
+            //.property("add-borders", true)
+            //.property("disable-passthrough", false)
             .build()
             .map_err(|e| {
                 log::error!("Failed to create videoconvertscale: {:?}", e);
@@ -48,7 +50,7 @@ impl AppsinkVideo {
         let appsink = gst::ElementFactory::make("appsink")
             .name("subwave_appsink")
             .property("drop", true)
-            .property("max-buffers", 3u32)
+            .property("max-buffers", 8u32)
             .property("sync", true)
             .property("enable-last-sample", false)
             .property(
@@ -65,19 +67,19 @@ impl AppsinkVideo {
             })?;
 
         // Add elements to bin
-        bin.add_many([&queue2, &videoconvertscale, &appsink]).map_err(|e| {
+        bin.add_many([&/*queue2, */&videoconvertscale, &appsink]).map_err(|e| {
             log::error!("Failed to add elements to bin: {:?}", e);
             Error::Cast
         })?;
 
         // Link elements: queue2 -> convert/scale -> appsink
-        gst::Element::link_many([&queue2, &videoconvertscale, &appsink]).map_err(|e| {
+        gst::Element::link_many([&/*queue2, */&videoconvertscale, &appsink]).map_err(|e| {
             log::error!("Failed to link elements: {:?}", e);
             Error::Cast
         })?;
 
         // Create ghost pad targeting the queue2 sink so upstream can feed into the buffer
-        let sink_pad = queue2.static_pad("sink").ok_or_else(|| {
+        let sink_pad = videoconvertscale.static_pad("sink").ok_or_else(|| {
             log::error!("Failed to get sink pad from queue2");
             Error::Cast
         })?;
@@ -472,6 +474,9 @@ impl Video for AppsinkVideo {
         let pipeline = gst::ElementFactory::make("playbin3")
             .property("uri", uri.as_str())
             .property("video-sink", &video_sink_bin)
+            .property("message-forward", true)
+            .property("buffer-duration", 5_000_000_000i64)
+            .property("buffer-size", 3_000_000i32)
             .build()?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;

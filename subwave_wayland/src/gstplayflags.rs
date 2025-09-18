@@ -130,14 +130,25 @@ pub mod gst_play_flags {
     }
 
     impl GstPlayFlags {
-        /// Get the default flags for network streaming with download enabled
-        pub fn for_network_stream() -> Self {
+        pub fn network() -> Self {
             Self::VIDEO
                 | Self::AUDIO
                 | Self::TEXT
                 | Self::SOFT_VOLUME
                 | Self::BUFFERING
                 | Self::DEINTERLACE
+        }
+
+        pub fn wayland_native() -> Self {
+            // Wayland path renders subtitles via subwave_overlay, so we keep
+            // playbin's text handling disabled to avoid autoplugging CPU paths.
+            Self::VIDEO
+                | Self::AUDIO
+                | Self::TEXT
+                | Self::SOFT_VOLUME
+                | Self::BUFFERING
+                | Self::DEINTERLACE
+                | Self::NATIVE_VIDEO
         }
 
         pub fn network_no_subs() -> Self {
