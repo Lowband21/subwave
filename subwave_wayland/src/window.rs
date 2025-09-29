@@ -10,11 +10,11 @@ use crate::WaylandIntegration;
 ///
 /// # Example
 /// ```no_run
-/// use iced_video_player_wayland::{Video, window};
+/// use subwave_wayland::{window, SubsurfaceVideo};
 ///
 /// // In your application's update function, after window creation:
 /// if let Some(integration) = window::get_wayland_integration() {
-///     let video = Video::new(&uri)?;
+///     let video = SubsurfaceVideo::new(&uri)?;
 ///     video.init_wayland(&integration)?;
 ///     // Now the video can be used with VideoPlayer widget
 /// }

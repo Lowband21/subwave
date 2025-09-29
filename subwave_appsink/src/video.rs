@@ -2,8 +2,6 @@ use crate::internal::Internal;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use iced::widget::image as img;
-use std::num::NonZeroU8;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -67,13 +65,14 @@ impl AppsinkVideo {
             })?;
 
         // Add elements to bin
-        bin.add_many([&/*queue2, */&videoconvertscale, &appsink]).map_err(|e| {
-            log::error!("Failed to add elements to bin: {:?}", e);
-            Error::Cast
-        })?;
+        bin.add_many([(&videoconvertscale), &appsink])
+            .map_err(|e| {
+                log::error!("Failed to add elements to bin: {:?}", e);
+                Error::Cast
+            })?;
 
         // Link elements: queue2 -> convert/scale -> appsink
-        gst::Element::link_many([&/*queue2, */&videoconvertscale, &appsink]).map_err(|e| {
+        gst::Element::link_many([(&videoconvertscale), &appsink]).map_err(|e| {
             log::error!("Failed to link elements: {:?}", e);
             Error::Cast
         })?;
@@ -184,17 +183,18 @@ impl AppsinkVideo {
                     s.get::<i32>("width"),
                     s.get::<i32>("height"),
                     s.get::<gst::Fraction>("framerate"),
-                ) {
-                    width = ((w + 4 - 1) / 4) * 4;
-                    height = h;
-                    framerate = fr.numer() as f64 / fr.denom() as f64;
-                    log::info!(
-                        "Got initial video properties: {}x{} @ {}fps",
-                        width,
-                        height,
-                        framerate
-                    );
-                }
+                )
+            {
+                width = ((w + 4 - 1) / 4) * 4;
+                height = h;
+                framerate = fr.numer() as f64 / fr.denom() as f64;
+                log::info!(
+                    "Got initial video properties: {}x{} @ {}fps",
+                    width,
+                    height,
+                    framerate
+                );
+            }
         } else {
             log::debug!("No initial caps available, will update on first sample");
         }
@@ -268,42 +268,40 @@ impl AppsinkVideo {
                         };
 
                     // Update video properties from the first sample with caps
-                    if !caps_checked
-                        && let Some(caps) = sample.caps() {
-                            log::debug!("Got caps from sample: {:?}", caps);
+                    if !caps_checked && let Some(caps) = sample.caps() {
+                        log::debug!("Got caps from sample: {:?}", caps);
 
-                            if let Some(s) = caps.structure(0)
-                                && let (Ok(w), Ok(h), Ok(fr)) = (
-                                    s.get::<i32>("width"),
-                                    s.get::<i32>("height"),
-                                    s.get::<gst::Fraction>("framerate"),
-                                ) {
-                                    let mut props = video_props_ref
-                                        .lock()
-                                        .map_err(|_| gst::FlowError::Error)?;
-                                    props.width = ((w + 4 - 1) / 4) * 4;
-                                    props.height = h;
-                                    props.framerate = fr.numer() as f64 / fr.denom() as f64;
-                                    props.has_video = true;
-                                    log::info!(
-                                        "Updated video properties from sample: {}x{} @ {}fps",
-                                        props.width,
-                                        props.height,
-                                        props.framerate
-                                    );
+                        if let Some(s) = caps.structure(0)
+                            && let (Ok(w), Ok(h), Ok(fr)) = (
+                                s.get::<i32>("width"),
+                                s.get::<i32>("height"),
+                                s.get::<gst::Fraction>("framerate"),
+                            )
+                        {
+                            let mut props =
+                                video_props_ref.lock().map_err(|_| gst::FlowError::Error)?;
+                            props.width = ((w + 4 - 1) / 4) * 4;
+                            props.height = h;
+                            props.framerate = fr.numer() as f64 / fr.denom() as f64;
+                            props.has_video = true;
+                            log::info!(
+                                "Updated video properties from sample: {}x{} @ {}fps",
+                                props.width,
+                                props.height,
+                                props.framerate
+                            );
 
-                                    // Recreate frame buffer with correct size
-                                    let new_size =
-                                        (props.width as usize * props.height as usize * 3)
-                                            .div_ceil(2);
-                                    let mut frame_guard =
-                                        frame_ref.lock().map_err(|_| gst::FlowError::Error)?;
-                                    frame_guard.resize(new_size, 0);
-                                    drop(frame_guard);
-                                    drop(props);
-                                }
-                            caps_checked = true;
+                            // Recreate frame buffer with correct size
+                            let new_size =
+                                (props.width as usize * props.height as usize * 3).div_ceil(2);
+                            let mut frame_guard =
+                                frame_ref.lock().map_err(|_| gst::FlowError::Error)?;
+                            frame_guard.resize(new_size, 0);
+                            drop(frame_guard);
+                            drop(props);
                         }
+                        caps_checked = true;
+                    }
 
                     *last_frame_time_ref
                         .lock()
@@ -352,10 +350,6 @@ impl AppsinkVideo {
             seek_position: None,
             last_valid_position: Duration::ZERO,
 
-            is_buffering: false,
-            buffering_percent: 100,
-            user_paused: false,
-
             current_bitrate: 0,
             avg_in_rate: 0,
 
@@ -390,60 +384,6 @@ impl AppsinkVideo {
     pub(crate) fn get_mut(&mut self) -> impl DerefMut<Target = Internal> + '_ {
         self.0.get_mut().expect("lock")
     }
-
-    /// Generates a list of thumbnails based on a set of positions in the media, downscaled by a given factor.
-    ///
-    /// Slow; only needs to be called once for each instance.
-    /// It's best to call this at the very start of playback, otherwise the position may shift.
-    fn thumbnails<I>(
-        &mut self,
-        positions: I,
-        downscale: NonZeroU8,
-    ) -> Result<Vec<img::Handle>, Error>
-    where
-        I: IntoIterator<Item = Position>,
-    {
-        let downscale = u8::from(downscale) as u32;
-
-        let paused = self.paused();
-        let muted = self.muted();
-        let pos = self.position();
-
-        self.set_paused(false);
-        self.set_muted(true);
-
-        let out = {
-            let mut inner = self.get_mut();
-            let props = inner.video_props.lock().expect("lock video props");
-            let width = props.width;
-            let height = props.height;
-            drop(props);
-
-            positions
-                .into_iter()
-                .map(|pos| {
-                    inner.seek(pos, true)?;
-                    inner.upload_frame.store(false, Ordering::SeqCst);
-                    while !inner.upload_frame.load(Ordering::SeqCst) {
-                        std::hint::spin_loop();
-                    }
-                    let frame_guard = inner.frame.lock().map_err(|_| Error::Lock)?;
-
-                    Ok(img::Handle::from_rgba(
-                        width as u32 / downscale,
-                        height as u32 / downscale,
-                        yuv_to_rgba(&frame_guard, width as _, height as _, downscale),
-                    ))
-                })
-                .collect()
-        };
-
-        self.set_paused(paused);
-        self.set_muted(muted);
-        self.seek(pos, true)?;
-
-        out
-    }
 }
 
 impl Video for AppsinkVideo {
@@ -465,7 +405,7 @@ impl Video for AppsinkVideo {
                     e
                 );
                 gst::parse::bin_from_description(
-                        "videoconvertscale n-threads=0 ! appsink name=iced_video drop=true caps=\"video/x-raw,format=(string){NV12},pixel-aspect-ratio=1/1\"",
+                        "videoconvertscale n-threads=0 ! appsink name=subwave_appsink drop=true caps=\"video/x-raw,format=(string){NV12},pixel-aspect-ratio=1/1\"",
                         true
                     )?.upcast()
             }
@@ -505,7 +445,7 @@ impl Video for AppsinkVideo {
             Error::Cast
         })?;
         let video_sink = video_sink_bin.by_name("subwave_appsink").ok_or_else(|| {
-            log::error!("Failed to find 'iced_video' element in video sink bin");
+            log::error!("Failed to find 'subwave_appsink' element in video sink bin");
             Error::Cast
         })?;
         let video_sink = video_sink.downcast::<gst_app::AppSink>().map_err(|_| {
@@ -700,35 +640,6 @@ impl Video for AppsinkVideo {
         let props = inner.video_props.lock().expect("lock video props");
         props.has_video
     }
-}
-
-fn yuv_to_rgba(yuv: &[u8], width: u32, height: u32, downscale: u32) -> Vec<u8> {
-    let uv_start = width * height;
-    let mut rgba = vec![];
-
-    for y in 0..height / downscale {
-        for x in 0..width / downscale {
-            let x_src = x * downscale;
-            let y_src = y * downscale;
-
-            let uv_i = uv_start + width * (y_src / 2) + x_src / 2 * 2;
-
-            let y = yuv[(y_src * width + x_src) as usize] as f32;
-            let u = yuv[uv_i as usize] as f32;
-            let v = yuv[(uv_i + 1) as usize] as f32;
-
-            let r = 1.164 * (y - 16.0) + 1.596 * (v - 128.0);
-            let g = 1.164 * (y - 16.0) - 0.813 * (v - 128.0) - 0.391 * (u - 128.0);
-            let b = 1.164 * (y - 16.0) + 2.018 * (u - 128.0);
-
-            rgba.push(r as u8);
-            rgba.push(g as u8);
-            rgba.push(b as u8);
-            rgba.push(0xFF);
-        }
-    }
-
-    rgba
 }
 
 impl Drop for AppsinkVideo {

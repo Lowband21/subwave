@@ -5,11 +5,10 @@ use std::{
 };
 
 use gstreamer::StreamCollection;
-use parking_lot::Mutex;
 use std::sync::mpsc;
 use subwave_core::{
     types::PendingState,
-    video::types::{AudioTrack, SubtitleTrack, VideoProperties},
+    video::types::{AudioTrack, SubtitleTrack},
 };
 
 use crate::{pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
@@ -23,7 +22,6 @@ pub(crate) struct Internal {
     pub(crate) pipeline: Option<Arc<SubsurfacePipeline>>, // read-mostly; clone and drop lock before external calls
     pub(crate) subsurface: Option<Arc<WaylandSubsurfaceManager>>, // same
 
-    pub(crate) video_props: Option<Arc<Mutex<VideoProperties>>>,
     pub(crate) duration: Option<Duration>,
     pub(crate) speed: f64,
 
@@ -31,6 +29,11 @@ pub(crate) struct Internal {
     pub(crate) looping: bool,
     pub(crate) is_eos: bool,
     pub(crate) restart_stream: bool,
+
+    // Buffering state
+    pub(crate) is_buffering: bool,
+    pub(crate) buffering_percent: i32,
+    pub(crate) user_paused: bool,
 
     // Bus thread control
     pub(crate) bus_thread: Option<JoinHandle<()>>,

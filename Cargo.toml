@@ -1,31 +1,44 @@
 [workspace]
 resolver = "3"
-members = ["subwave_appsink","subwave_core","subwave_wayland","subwave_unified"]
+members = [
+  "subwave_appsink",
+  "subwave_core",
+  "subwave_wayland",
+  "subwave_unified",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Grayson Hieb"]
 license = "MIT OR Apache-2.0"
-#repository = "https://github.com/Lowband21/rusty-media-server"
-#documentation = "https://docs.rs/ferrix"
-#homepage = "https://github.com/Lowband21/ferrix_media_server"
+repository = "https://github.com/Lowband21/Subwave"
+documentation = "https://docs.rs/subwave"
+homepage = "https://github.com/Lowband21/Subwave"
 readme = "README.md"
-keywords = ["streaming", "rust", "video", "hdr", "iced", "shader"]
+keywords = [
+  "streaming",
+  "rust",
+  "video",
+  "hdr",
+  "iced",
+  "gstreamer",
+  "wayland",
+  "shader",
+]
 categories = ["multimedia"]
 
 [workspace.dependencies]
 # Iced dependencies
-iced = { git = "https://github.com/Lowband21/iced-ferrix.git", branch = "feature/batched_primitives", default-features=false, features = [
-    "advanced",
-    "wgpu",
-    "image",
-    "thread-pool",
-    "prefer_10bit",
-    "wayland-hack"
+iced = { git = "https://github.com/Lowband21/iced-ferrix.git", default-features = false, features = [
+  "advanced",
+  "wgpu",
+  "image",
+  "thread-pool",
+  "prefer_10bit",
+  "wayland-hack",
 ] }
-iced_wgpu = { git = "https://github.com/Lowband21/iced-ferrix.git", branch = "feature/batched_primitives" }
-iced_winit = { git = "https://github.com/Lowband21/iced-ferrix.git", branch = "feature/batched_primitives" }
+iced_wgpu = { git = "https://github.com/Lowband21/iced-ferrix.git" }
+iced_winit = { git = "https://github.com/Lowband21/iced-ferrix.git" }
 
 # GStreamer dependencies
 gstreamer = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.git", branch = "main" }
@@ -33,9 +46,7 @@ gstreamer-pbutils = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-
 gstreamer-video = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.git", branch = "main" }
 gstreamer-video-sys = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.git", branch = "main" }
 gstreamer-app = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.git", branch = "main" }
-## glib is provided by gstreamer crates
-#glib = "0.21.1"
 
 log = "0.4"
-thiserror = "^1"
+thiserror = "^2"
 url = "2"

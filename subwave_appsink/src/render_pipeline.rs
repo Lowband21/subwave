@@ -10,33 +10,6 @@ use std::{
     },
 };
 
-// Convert f32 to f16 bits (IEEE 754 half precision)
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = (bits >> 16) & 0x8000;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7fffff;
-
-    if exponent == 0xff {
-        // Infinity or NaN
-        let mantissa_bits = if mantissa != 0 { 0x200 } else { 0 }; // Preserve NaN
-        return (sign | 0x7c00 | mantissa_bits) as u16;
-    }
-
-    let exponent = exponent - 127 + 15;
-
-    if exponent >= 31 {
-        // Overflow - return infinity
-        return (sign | 0x7c00) as u16;
-    } else if exponent <= 0 {
-        // Underflow - return zero
-        return sign as u16;
-    }
-
-    let mantissa = mantissa >> 13;
-    ((sign | (exponent << 10) as u32 | mantissa) & 0xffff) as u16
-}
-
 #[repr(C)]
 struct Uniforms {
     rect: [f32; 4],
@@ -48,7 +21,7 @@ struct VideoEntry {
     texture_y: wgpu::Texture,
     texture_uv: wgpu::Texture,
     instances: wgpu::Buffer,
-    video_uniforms: wgpu::Buffer,
+    _video_uniforms: wgpu::Buffer,
     bg0: wgpu::BindGroup,
     alive: Arc<AtomicBool>,
     //pixel_format: VideoPixelFormat,
@@ -57,7 +30,16 @@ struct VideoEntry {
     render_index: AtomicUsize,
 }
 
-struct VideoRenderPipeline {
+struct UploadParams<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    alive: &'a Arc<AtomicBool>,
+    dimensions: (u32, u32),
+    frame: &'a [u8],
+    format: TextureFormat,
+}
+
+pub(crate) struct VideoRenderPipeline {
     render_pipeline: wgpu::RenderPipeline,
     bg0_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -67,7 +49,7 @@ struct VideoRenderPipeline {
 impl VideoRenderPipeline {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         // Log the format we're using
-        log::warn!("=== ICED VIDEO PIPELINE FORMAT ===");
+        log::warn!("=== SUBWAVE VIDEO PIPELINE FORMAT ===");
         log::warn!("Creating pipeline with render target format: {:?}", format);
         log::warn!("Format details:");
         match format {
@@ -88,7 +70,7 @@ impl VideoRenderPipeline {
         });
 
         let bg0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("iced_video_player bind group 0 layout"),
+            label: Some("subwave bind group 0 layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -199,20 +181,16 @@ impl VideoRenderPipeline {
         }
     }
 
-    fn upload(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        video_id: u64,
-        alive: &Arc<AtomicBool>,
-        (width, height): (u32, u32),
-        frame: &[u8],
-        format: TextureFormat,
-        //color_range: crate::video_properties::ColorRange,
-        //matrix_coefficients: crate::gst_utils::colorimetry::MatrixCoefficients,
-        //transfer_function: crate::gst_utils::colorimetry::TransferFunction,
-        //tone_mapping_config: &ToneMappingConfig,
-    ) {
+    fn upload(&mut self, video_id: u64, params: UploadParams<'_>) {
+        let UploadParams {
+            device,
+            queue,
+            alive,
+            dimensions: (width, height),
+            frame,
+            format: _format,
+        } = params;
+
         if let Entry::Vacant(entry) = self.videos.entry(video_id) {
             // For now we assume NV12 input from appsink: Y plane (R8) and interleaved UV plane (RG8)
             // In the future, detect caps and pick from pixel_format.rs
@@ -307,7 +285,7 @@ impl VideoRenderPipeline {
             });
 
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("iced_video_player bind group"),
+                label: Some("subwave bind group"),
                 layout: &self.bg0_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -345,7 +323,7 @@ impl VideoRenderPipeline {
                 texture_y,
                 texture_uv,
                 instances,
-                video_uniforms,
+                _video_uniforms: video_uniforms,
                 bg0: bind_group,
                 alive: Arc::clone(alive),
                 //pixel_format,
@@ -419,17 +397,6 @@ impl VideoRenderPipeline {
         }
     }
 
-    fn reset_textures(&mut self, video_id: u64) {
-        // Force texture recreation by removing the video entry
-        if let Some(video) = self.videos.remove(&video_id) {
-            video.texture_y.destroy();
-            video.texture_uv.destroy();
-            video.instances.destroy();
-            video.video_uniforms.destroy();
-            log::info!("Reset textures for video {}", video_id);
-        }
-    }
-
     fn prepare(&mut self, queue: &wgpu::Queue, video_id: u64, bounds: &iced::Rectangle) {
         if let Some(video) = self.videos.get_mut(&video_id) {
             let uniforms = Uniforms {
@@ -468,10 +435,11 @@ impl VideoRenderPipeline {
     ) {
         if let Some(video) = self.videos.get(&video_id) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("iced_video_player render pass"),
+                label: Some("subwave render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -531,48 +499,51 @@ impl VideoPrimitive {
 }
 
 impl Primitive for VideoPrimitive {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    type Renderer = VideoRenderPipeline;
+
+    fn initialize(
+        &self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) -> Self::Renderer {
+        log::warn!(
+            "VideoPrimitive::initialize creating new pipeline with format: {:?}",
+            format
+        );
+        eprintln!("=== CREATING VIDEO PIPELINE ===");
+        eprintln!("Surface format: {:?}", format);
+        eprintln!("===============================");
+
+        VideoRenderPipeline::new(device, format)
     }
 
     fn prepare(
         &self,
+        renderer: &mut Self::Renderer,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-        storage: &mut iced_wgpu::primitive::Storage,
         bounds: &iced::Rectangle,
         viewport: &iced_wgpu::graphics::Viewport,
     ) {
-        if !storage.has::<VideoRenderPipeline>() {
-            log::warn!(
-                "VideoPrimitive::prepare creating new pipeline with format: {:?}",
-                format
-            );
-            eprintln!("=== CREATING VIDEO PIPELINE ===");
-            eprintln!("Surface format: {:?}", format);
-            eprintln!("===============================");
-            storage.store(VideoRenderPipeline::new(device, format));
-        }
-
-        let pipeline = storage.get_mut::<VideoRenderPipeline>().unwrap();
-
         if self.upload_frame {
             let frame = self.frame.lock().expect("lock frame mutex");
             if !frame.is_empty() {
-                pipeline.upload(
-                    device,
-                    queue,
+                renderer.upload(
                     self.video_id,
-                    &self.alive,
-                    self.size,
-                    &frame,
-                    format,
+                    UploadParams {
+                        device,
+                        queue,
+                        alive: &self.alive,
+                        dimensions: self.size,
+                        frame: &frame,
+                        format: self.format,
+                    },
                 );
             }
         }
 
-        pipeline.prepare(
+        renderer.prepare(
             queue,
             self.video_id,
             &(*bounds
@@ -585,12 +556,11 @@ impl Primitive for VideoPrimitive {
 
     fn render(
         &self,
+        renderer: &Self::Renderer,
         encoder: &mut wgpu::CommandEncoder,
-        storage: &iced_wgpu::primitive::Storage,
         target: &wgpu::TextureView,
         clip_bounds: &iced::Rectangle<u32>,
     ) {
-        let pipeline = storage.get::<VideoRenderPipeline>().unwrap();
-        pipeline.draw(target, encoder, clip_bounds, self.video_id);
+        renderer.draw(target, encoder, clip_bounds, self.video_id);
     }
 }

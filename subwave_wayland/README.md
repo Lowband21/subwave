@@ -1,19 +1,19 @@
-# iced_video_player_wayland
+# subwave_wayland
 
-Wayland subsurface-based video player widget for Iced with HDR passthrough support.
+Wayland subsurface-based video output for Iced with HDR passthrough support.
 
 ## Current Status: Alpha
 
-✅ **Video output is fully functional** - Dual subsurface implementation with background and video layers.
+**Video output is fully functional** - Dual subsurface implementation with background and video layers.
 
 ### What Works
-- ✅ Video playback via Wayland subsurfaces
-- ✅ Dual-layer subsurface architecture (background + video)
-- ✅ Integration with iced's rendering pipeline via thread-local storage
-- ✅ GStreamer pipeline with waylandsink
-- ✅ Wayland display context sharing
-- ✅ Pre-commit hook synchronization for position updates
-- ✅ Zero-copy video rendering with hardware acceleration
+- [x] Video playback via Wayland subsurfaces
+- [x] Dual-layer subsurface architecture (background + video)
+- [x] Integration with iced's rendering pipeline via thread-local storage
+- [x] GStreamer pipeline with waylandsink
+- [x] Wayland display context sharing
+- [x] Pre-commit hook synchronization for position updates
+- [x] Zero-copy video rendering with hardware acceleration
 
 ## Architecture
 This crate implements video playback using Wayland subsurfaces, which allows:
@@ -37,7 +37,7 @@ This crate implements video playback using Wayland subsurfaces, which allows:
    - Dynamic pipeline creation
    - Direct rendering to Wayland surface via VideoOverlay interface
 
-4. **WaylandIntegration** (in iced fork)
+4. **WaylandIntegration** (in iced_ferrix)
    - Thread-local storage for Wayland handles
    - Pre-commit hooks for atomic updates
    - Set/cleared during iced's draw cycle
@@ -67,7 +67,7 @@ pub fn surface_handle(&self) -> usize {
 
 ## Required Iced Fork Modifications
 
-The iced fork at `../iced_fork` has been modified to expose Wayland handles:
+The iced fork at `git@github.com:Lowband21/iced-ferrix.git` has been modified to expose Wayland handles:
 
 ### iced_winit Changes
 - Added thread-local storage for WaylandIntegration
@@ -81,34 +81,33 @@ The implementation uses two subsurfaces for optimal rendering:
 1. **Background Subsurface**: Provides a black background layer
 2. **Video Subsurface**: Renders the actual video content on top
 
-This approach ensures proper video display and prevents transparency issues.
+This approach ensures proper video display and prevents transparency issues, but will likely be made redundant by upstream gstreamer changes eventually.
 
 ### Next Steps
-1. Audio track management
-2. Subtitle management
-3. Add content fit support through aspect ratio pipeline element
-4. Playback speed integration
-5. Resolve edge case audio pipeline failure (only known recreatable with one particular media source)
-6. Add proper error handling, recovery and/or fallback mechanisms
+1. Subtitle management
+  - Requires upstream gstreamer changes
+2. Add content fit support through aspect ratio pipeline element
+3. Playback speed integration
 
 ## Usage
 
 ```rust
-use iced_video_player_wayland::{init, Video, VideoPlayer};
+use subwave_wayland::{init, VideoPlayer, SubsurfaceVideo};
 
-// Initialize GStreamer
+// Initialize GStreamer first
 init().expect("Failed to initialize GStreamer");
 
 // Create video from URL
-let video = Video::new(&url).expect("Failed to create video");
+let url = url::Url::parse("file:///path/to/video.mkv").unwrap();
+let video = SubsurfaceVideo::new(&url).expect("Failed to create video");
 
-// Create widget
+// Build an Iced widget to reserve layout space and drive updates
 let player = VideoPlayer::new(&video)
-    .width(Length::Fill)
-    .height(Length::Fill);
+    .width(iced::Length::Fill)
+    .height(iced::Length::Fill);
 ```
 
-// Make sure to store and pass Video for the duration of playback
+Note: Keep the `SubsurfaceVideo` alive for the duration of playback.
 
 ## Testing
 
@@ -126,10 +125,12 @@ wayland-info | grep -A5 subsurface
 
 ## Dependencies
 
-- iced (with custom fork for Wayland integration)
-- GStreamer 1.27.1 developer build
+- Iced (using a fork that exposes Wayland handles)
+- GStreamer 1.27.x developer build
 - wayland-client 0.31
 - Wayland compositor with subsurface support
+
+Note: The Wayland backend is WGPU-only. Use Iced with the `wgpu` renderer and disable tiny-skia fallback in your application to ensure subsurface video integrates with the render loop correctly.
 
 ## License
 

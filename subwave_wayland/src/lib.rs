@@ -11,7 +11,7 @@ pub mod window;
 pub use subsurface_manager::WaylandSubsurfaceManager;
 pub use subwave_core::Error;
 pub use video::SubsurfaceVideo;
-pub use video_player::VideoPlayer;
+pub use video_player::{VideoHandle, VideoPlayer};
 pub use wayland_integration::WaylandIntegration;
 
 pub type Result<T> = std::result::Result<T, subwave_core::Error>;

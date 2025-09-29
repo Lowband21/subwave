@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::{marker::PhantomData, sync::atomic::Ordering, time::Instant};
 use subwave_core::video::video_trait::Video;
 
+type ErrorCallback<'a, Message> = Box<dyn Fn(&glib::Error) -> Message + 'a>;
+
 /// Video player widget which displays the current frame of a [`Video`](crate::Video).
 pub struct VideoPlayer<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer>
 where
@@ -22,8 +24,7 @@ where
     height: iced::Length,
     on_end_of_stream: Option<Message>,
     on_new_frame: Option<Message>,
-    on_error: Option<Box<dyn Fn(&glib::Error) -> Message + 'a>>,
-    on_buffering: Option<Box<dyn Fn(i32) -> Message + 'a>>,
+    on_error: Option<ErrorCallback<'a, Message>>,
     _phantom: PhantomData<(Theme, Renderer)>,
 }
 
@@ -41,7 +42,6 @@ where
             on_end_of_stream: None,
             on_new_frame: None,
             on_error: None,
-            on_buffering: None,
             _phantom: Default::default(),
         }
     }
@@ -96,18 +96,6 @@ where
             ..self
         }
     }
-
-    /// Message to send when the video is buffering.
-    /// The callback receives the buffering percentage (0-100).
-    pub fn on_buffering<F>(self, on_buffering: F) -> Self
-    where
-        F: 'a + Fn(i32) -> Message,
-    {
-        VideoPlayer {
-            on_buffering: Some(Box::new(on_buffering)),
-            ..self
-        }
-    }
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -124,7 +112,7 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         _tree: &mut widget::Tree,
         _renderer: &Renderer,
         limits: &layout::Limits,
@@ -304,43 +292,7 @@ where
                                 );
                             }
                         }
-                        gst::MessageView::Buffering(_buffering) => {
-                            /*
-                            let percent = buffering.percent();
-                            log::debug!("Buffering: {}%", percent);
-
-                            // Update buffering state
-                            inner.buffering_percent = percent;
-
-                            // Send buffering message to UI
-                            if let Some(ref on_buffering) = self.on_buffering {
-                                shell.publish(on_buffering(percent));
-                            }
-
-                            if percent < 100 {
-                                // Start buffering
-                                if !inner.is_buffering {
-                                    inner.is_buffering = true;
-                                    // Pause playback if not already paused by user
-                                    if !inner.user_paused
-                                        && inner.source.current_state() == gst::State::Playing
-                                    {
-                                        inner.source.set_state(gst::State::Paused).ok();
-                                        log::info!("Pausing for buffering at {}%", percent);
-                                    }
-                                }
-                            } else {
-                                // Buffering complete
-                                if inner.is_buffering {
-                                    inner.is_buffering = false;
-                                    // Resume playback if not paused by user
-                                    if !inner.user_paused {
-                                        inner.source.set_state(gst::State::Playing).ok();
-                                        log::info!("Resuming after buffering complete");
-                                    }
-                                }
-                            } */
-                        }
+                        gst::MessageView::Buffering(_) => {}
                         gst::MessageView::StreamCollection(stream_collection) => {
                             log::info!("Received StreamCollection message");
 

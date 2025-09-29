@@ -59,3 +59,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     return vec4<f32>(rgb, 1.0);
 }
+// Provenance: Derived from iced_video_player (MIT OR Apache-2.0)
+// Upstream repository: https://github.com/jazzfool/iced_video_player
+// Reference commit: a8656e8021f7a6c316760fffc84664b92e5abc61 (master)
+// Adapted within subwave_appsink; see ../ACKNOWLEDGMENTS.md

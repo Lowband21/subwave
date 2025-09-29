@@ -5,7 +5,6 @@ use gstreamer_video::{
     VideoOverlay,
 };
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::gstplayflags::gst_play_flags::GstPlayFlags;
 
@@ -14,9 +13,7 @@ use subwave_core::video::types::Position;
 
 pub struct SubsurfacePipeline {
     speed: f64,
-    pub last_valid_position: Option<Duration>,
     pub pipeline: Arc<gst::Pipeline>,
-    subsurface: Arc<WaylandSubsurfaceManager>,
 }
 
 impl SubsurfacePipeline {
@@ -57,13 +54,7 @@ impl SubsurfacePipeline {
 
         pipeline.set_property("uri", uri.as_str());
 
-<<<<<<< HEAD
-        pipeline.set_property("flags", GstPlayFlags::network_no_subs());
-||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
-        pipeline.set_property("flags", GstPlayFlags::for_network_stream());
-=======
         pipeline.set_property("flags", GstPlayFlags::wayland_native());
->>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
 
         let video_sink = gst::ElementFactory::make("waylandsink")
             .name("vsink")
@@ -150,23 +141,23 @@ impl SubsurfacePipeline {
         let vsink_bin = gst::Bin::with_name("waylandsink-bin");
 
         // Insert a buffering queue to decouple upstream reconfiguration when subtitles are enabled
-        let queue2 = gst::ElementFactory::make("queue2")
-            .name("video-buffer")
-            .property("use-buffering", true)
-            //.property("low-watermark", 0.25f64)
-            //.property("high-watermark", 0.85f64)
-            .property("max-size-buffers", 20u32)
-            //.property("max-size-time", 6_000_000_000u64) // 5s
-            //.property("max-size-bytes", 4_000_000u32)
-            .property("max-size-bytes", 0u32)
-            //.property("ring-buffer-max-size", 536870912u64)
-            //.property("use-bitrate-query", true)
-            //.property("use-rate-estimate", true)
-            .build()
-            .map_err(|err| {
-                println!("Failed to build video buffer queue2: {}", err);
-                Error::Pipeline("Failed to build queue2 for video sink".to_string())
-            })?;
+        //let queue2 = gst::ElementFactory::make("queue2")
+        //    .name("video-buffer")
+        //    .property("use-buffering", true)
+        //    //.property("low-watermark", 0.25f64)
+        //    //.property("high-watermark", 0.85f64)
+        //    .property("max-size-buffers", 20u32)
+        //    //.property("max-size-time", 6_000_000_000u64) // 5s
+        //    //.property("max-size-bytes", 4_000_000u32)
+        //    .property("max-size-bytes", 0u32)
+        //    //.property("ring-buffer-max-size", 536870912u64)
+        //    //.property("use-bitrate-query", true)
+        //    //.property("use-rate-estimate", true)
+        //    .build()
+        //    .map_err(|err| {
+        //        println!("Failed to build video buffer queue2: {}", err);
+        //        Error::Pipeline("Failed to build queue2 for video sink".to_string())
+        //    })?;
 
         let vapostproc = gst::ElementFactory::make("vapostproc")
             .name("vapostproc")
@@ -186,16 +177,16 @@ impl SubsurfacePipeline {
         }
 
         vsink_bin
-            .add_many([&queue2, &vapostproc, &video_sink])
+            .add_many([(&vapostproc), &video_sink])
             .map_err(|e| {
                 Error::Pipeline(format!("Failed to add elements to video-sink bin: {}", e))
             })?;
-        gst::Element::link_many([&queue2, &vapostproc, &video_sink])
+        gst::Element::link_many([(&vapostproc), &video_sink])
             .map_err(|e| Error::Pipeline(format!("Failed to link video-sink chain: {}", e)))?;
 
         // Create and add a ghost pad so playbin3 can link video into this bin through the buffer
-        let ghost_pad =
-            gst::GhostPad::with_target(&queue2.static_pad("sink").unwrap()).map_err(|e| {
+        let ghost_pad = gst::GhostPad::with_target(&vapostproc.static_pad("sink").unwrap())
+            .map_err(|e| {
                 Error::Pipeline(format!("Failed to create ghost pad for text-sink: {}", e))
             })?;
 
@@ -204,6 +195,7 @@ impl SubsurfacePipeline {
         })?;
 
         vsink_bin.set_property("message_forward", true);
+        // Should still test this
         vsink_bin.set_property("async-handling", false);
 
         pipeline.set_property("video-sink", vsink_bin);
@@ -218,9 +210,7 @@ impl SubsurfacePipeline {
 
         Ok(Self {
             speed: 1.0,
-            last_valid_position: None,
             pipeline: Arc::new(pipeline),
-            subsurface: Arc::clone(subsurface),
         })
     }
 
@@ -346,9 +336,6 @@ impl SubsurfacePipeline {
 
     /// Stop playback
     pub fn stop(&self) -> Result<()> {
-        // First, clear any on-screen subtitle to avoid leaving a stale buffer
-        let _ = self.subsurface.clear_subtitle();
-
         // Finally, stop the overall pipeline
         self.pipeline
             .set_state(gst::State::Null)
@@ -428,8 +415,6 @@ impl SubsurfacePipeline {
                 video_overlay.handle_events(true); // Still don't know what this does or if it's necessary
             }
         }
-        // Keep Wayland subtitle surface in sync with the draw area (no viewport fiddling)
-        self.subsurface.set_size(width, height);
     }
 
     /// Set the playback rate (speed)

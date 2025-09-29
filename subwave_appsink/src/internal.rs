@@ -40,11 +40,6 @@ pub(crate) struct Internal {
     pub(crate) seek_position: Option<Duration>,
     pub(crate) last_valid_position: Duration,
 
-    // Buffering state
-    pub(crate) is_buffering: bool,
-    pub(crate) buffering_percent: i32,
-    pub(crate) user_paused: bool, // Track if user manually paused
-
     // Connection monitoring
     pub(crate) current_bitrate: u64, // bits per second
     pub(crate) avg_in_rate: i64,     // average input rate from queue2
@@ -196,19 +191,13 @@ impl Internal {
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) {
-        // Track user-initiated pause state
-        self.user_paused = paused;
-
-        // Only change state if not buffering, or if explicitly pausing
-        if !self.is_buffering || paused {
-            self.source
-                .set_state(if paused {
-                    gst::State::Paused
-                } else {
-                    gst::State::Playing
-                })
-                .unwrap(/* state was changed in ctor; state errors caught there */);
-        }
+        self.source
+            .set_state(if paused {
+                gst::State::Paused
+            } else {
+                gst::State::Playing
+            })
+            .unwrap(/* state was changed in ctor; state errors caught there */);
 
         // Set restart_stream flag to make the stream restart on the next Message::NextFrame
         if self.is_eos && !paused {
@@ -253,28 +242,6 @@ impl Internal {
             return;
         };
         if let Ok(video_sink_bin) = video_sink.dynamic_cast::<gst::Bin>()
-<<<<<<< HEAD
-            && let Some(buffer) = video_sink_bin.by_name("video-buffer") {
-                // Check if this is actually a queue2 element that has the properties we need
-                if buffer.has_property("avg-in-rate") {
-                    // Get average input rate
-                    let avg_in: u64 = buffer.property("avg-in-rate");
-                    if avg_in > 0 {
-                        self.avg_in_rate = avg_in;
-                        log::trace!("Queue2 average input rate: {} bytes/sec", avg_in);
-                    }
-||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
-            && let Some(buffer) = video_sink_bin.by_name("video-buffer")
-        {
-            // Check if this is actually a queue2 element that has the properties we need
-            if buffer.has_property("avg-in-rate") {
-                // Get average input rate
-                let avg_in: u64 = buffer.property("avg-in-rate");
-                if avg_in > 0 {
-                    self.avg_in_rate = avg_in;
-                    log::trace!("Queue2 average input rate: {} bytes/sec", avg_in);
-                }
-=======
             && let Some(buffer) = video_sink_bin.by_name("video-buffer")
         {
             // Check if this is actually a queue2 element that has the properties we need
@@ -286,55 +253,24 @@ impl Internal {
                     self.avg_in_rate = avg_in;
                     log::trace!("Queue2 average input rate: {} bytes/sec", avg_in);
                 }
->>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
 
-<<<<<<< HEAD
-                    // Get current level bytes for monitoring
-                    if buffer.has_property("current-level-bytes") {
-                        let current_level: u64 = buffer.property("current-level-bytes");
-                        log::trace!("Queue2 current buffer level: {} bytes", current_level);
-                    }
-||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
-                // Get current level bytes for monitoring
-                if buffer.has_property("current-level-bytes") {
-                    let current_level: u64 = buffer.property("current-level-bytes");
-                    log::trace!("Queue2 current buffer level: {} bytes", current_level);
-                }
-=======
                 // Get current level bytes for monitoring
                 if buffer.has_property("current-level-bytes") {
                     let current_level: u32 = buffer.property("current-level-bytes");
                     log::trace!("Queue2 current buffer level: {} bytes", current_level);
                 }
->>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
 
-<<<<<<< HEAD
-                    // Update connection speed on playbin based on measured rate
-                    if self.avg_in_rate > 0 {
-                        // Convert bytes/sec to bits/sec
-                        let bits_per_sec = self.avg_in_rate * 8;
-                        self.source.set_property("connection-speed", bits_per_sec);
-                        self.current_bitrate = bits_per_sec;
-                    }
-                } else {
-                    log::trace!("Buffer element is not queue2, skipping stats update");
-||||||| parent of 80f6bfb (feat: zerocopy video but no subtitles)
-                // Update connection speed on playbin based on measured rate
-                if self.avg_in_rate > 0 {
-                    // Convert bytes/sec to bits/sec
-                    let bits_per_sec = self.avg_in_rate * 8;
-                    self.source.set_property("connection-speed", bits_per_sec);
-                    self.current_bitrate = bits_per_sec;
-=======
                 // Update connection speed on playbin based on measured rate
                 if self.avg_in_rate > 0 {
                     // Convert bytes/sec to bits/sec
                     let bits_per_sec: u64 = self.avg_in_rate.saturating_mul(8) as u64;
                     self.source.set_property("connection-speed", bits_per_sec);
                     self.current_bitrate = bits_per_sec;
->>>>>>> 80f6bfb (feat: zerocopy video but no subtitles)
                 }
+            } else {
+                log::trace!("Buffer element is not queue2, skipping stats update");
             }
+        }
     }
 
     /// Check if error should trigger reconnection attempt
@@ -449,32 +385,34 @@ impl Internal {
         // Find and add video stream(s)
         for i in 0..collection.len() {
             if let Some(stream) = collection.stream(i as u32)
-                && stream.stream_type() == gst::StreamType::VIDEO {
-                    // Check if this stream was previously selected
-                    if let Some(stream_id) = stream.stream_id() {
-                        let stream_id_str = stream_id.to_string();
-                        if self.selected_stream_ids.contains(&stream_id_str) {
-                            new_selection.push(stream_id_str);
-                        }
+                && stream.stream_type() == gst::StreamType::VIDEO
+            {
+                // Check if this stream was previously selected
+                if let Some(stream_id) = stream.stream_id() {
+                    let stream_id_str = stream_id.to_string();
+                    if self.selected_stream_ids.contains(&stream_id_str) {
+                        new_selection.push(stream_id_str);
                     }
                 }
+            }
         }
 
         // Find and add audio stream(s)
         let mut audio_index = 0;
         for i in 0..collection.len() {
             if let Some(stream) = collection.stream(i as u32)
-                && stream.stream_type() == gst::StreamType::AUDIO {
-                    if audio_index == self.current_audio_track {
-                        new_selection.push(
-                            stream
-                                .stream_id()
-                                .map(|id| id.to_string())
-                                .unwrap_or_else(|| String::from("unknown")),
-                        );
-                    }
-                    audio_index += 1;
+                && stream.stream_type() == gst::StreamType::AUDIO
+            {
+                if audio_index == self.current_audio_track {
+                    new_selection.push(
+                        stream
+                            .stream_id()
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| String::from("unknown")),
+                    );
                 }
+                audio_index += 1;
+            }
         }
 
         // Handle subtitle selection
@@ -494,18 +432,19 @@ impl Internal {
                 let mut subtitle_index = 0;
                 for i in 0..collection.len() {
                     if let Some(stream) = collection.stream(i as u32)
-                        && stream.stream_type() == gst::StreamType::TEXT {
-                            if subtitle_index == index {
-                                new_selection.push(
-                                    stream
-                                        .stream_id()
-                                        .map(|id| id.to_string())
-                                        .unwrap_or_else(|| String::from("unknown")),
-                                );
-                                break;
-                            }
-                            subtitle_index += 1;
+                        && stream.stream_type() == gst::StreamType::TEXT
+                    {
+                        if subtitle_index == index {
+                            new_selection.push(
+                                stream
+                                    .stream_id()
+                                    .map(|id| id.to_string())
+                                    .unwrap_or_else(|| String::from("unknown")),
+                            );
+                            break;
                         }
+                        subtitle_index += 1;
+                    }
                 }
 
                 self.current_subtitle_track = Some(index);
@@ -595,54 +534,58 @@ impl Internal {
         // Find and add video stream(s)
         for i in 0..collection.len() {
             if let Some(stream) = collection.stream(i as u32)
-                && stream.stream_type() == gst::StreamType::VIDEO {
-                    // Check if this stream was previously selected
-                    if let Some(stream_id) = stream.stream_id() {
-                        let stream_id_str = stream_id.to_string();
-                        if self.selected_stream_ids.contains(&stream_id_str) {
-                            new_selection.push(stream_id_str);
-                        }
+                && stream.stream_type() == gst::StreamType::VIDEO
+            {
+                // Check if this stream was previously selected
+                if let Some(stream_id) = stream.stream_id() {
+                    let stream_id_str = stream_id.to_string();
+                    if self.selected_stream_ids.contains(&stream_id_str) {
+                        new_selection.push(stream_id_str);
                     }
                 }
+            }
         }
 
         // Find and add the selected audio stream
         let mut audio_index = 0;
         for i in 0..collection.len() {
             if let Some(stream) = collection.stream(i as u32)
-                && stream.stream_type() == gst::StreamType::AUDIO {
-                    if audio_index == track_index {
+                && stream.stream_type() == gst::StreamType::AUDIO
+            {
+                if audio_index == track_index {
+                    new_selection.push(
+                        stream
+                            .stream_id()
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| String::from("unknown")),
+                    );
+                }
+                audio_index += 1;
+            }
+        }
+
+        // Add current subtitle stream if enabled
+        if self.subtitles_enabled
+            && let Some(subtitle_track) = self.current_subtitle_track
+        {
+            let mut subtitle_index = 0;
+            for i in 0..collection.len() {
+                if let Some(stream) = collection.stream(i as u32)
+                    && stream.stream_type() == gst::StreamType::TEXT
+                {
+                    if subtitle_index == subtitle_track {
                         new_selection.push(
                             stream
                                 .stream_id()
                                 .map(|id| id.to_string())
                                 .unwrap_or_else(|| String::from("unknown")),
                         );
+                        break;
                     }
-                    audio_index += 1;
-                }
-        }
-
-        // Add current subtitle stream if enabled
-        if self.subtitles_enabled
-            && let Some(subtitle_track) = self.current_subtitle_track {
-                let mut subtitle_index = 0;
-                for i in 0..collection.len() {
-                    if let Some(stream) = collection.stream(i as u32)
-                        && stream.stream_type() == gst::StreamType::TEXT {
-                            if subtitle_index == subtitle_track {
-                                new_selection.push(
-                                    stream
-                                        .stream_id()
-                                        .map(|id| id.to_string())
-                                        .unwrap_or_else(|| String::from("unknown")),
-                                );
-                                break;
-                            }
-                            subtitle_index += 1;
-                        }
+                    subtitle_index += 1;
                 }
             }
+        }
 
         self.current_audio_track = track_index;
 
@@ -712,21 +655,23 @@ impl Internal {
 
                         // Extract info from caps if available
                         if let Some(caps) = caps
-                            && let Some(s) = caps.structure(0) {
-                                if let Ok(rate) = s.get::<i32>("rate") {
-                                    audio_track.sample_rate = Some(rate);
-                                }
-                                if let Ok(channels) = s.get::<i32>("channels") {
-                                    audio_track.channels = Some(channels);
-                                }
+                            && let Some(s) = caps.structure(0)
+                        {
+                            if let Ok(rate) = s.get::<i32>("rate") {
+                                audio_track.sample_rate = Some(rate);
                             }
+                            if let Ok(channels) = s.get::<i32>("channels") {
+                                audio_track.channels = Some(channels);
+                            }
+                        }
 
                         // If stream is selected by default, track it
                         if stream.stream_flags().contains(gst::StreamFlags::SELECT)
-                            && let Some(id) = stream_id {
-                                self.selected_stream_ids.push(id.to_string());
-                                self.current_audio_track = audio_track.index;
-                            }
+                            && let Some(id) = stream_id
+                        {
+                            self.selected_stream_ids.push(id.to_string());
+                            self.current_audio_track = audio_track.index;
+                        }
 
                         self.available_audio_tracks.push(audio_track);
                     }
@@ -753,22 +698,15 @@ impl Internal {
                             }
                         }
 
-                        // If stream is selected by default, track it
-                        if stream.stream_flags().contains(gst::StreamFlags::SELECT)
-                            && let Some(id) = stream_id {
-                                self.selected_stream_ids.push(id.to_string());
-                                self.current_subtitle_track = Some(subtitle_track.index);
-                                self.subtitles_enabled = true;
-                            }
-
                         self.available_subtitles.push(subtitle_track);
                     }
                     gst::StreamType::VIDEO => {
                         // Track selected video streams
                         if stream.stream_flags().contains(gst::StreamFlags::SELECT)
-                            && let Some(id) = stream_id {
-                                self.selected_stream_ids.push(id.to_string());
-                            }
+                            && let Some(id) = stream_id
+                        {
+                            self.selected_stream_ids.push(id.to_string());
+                        }
                     }
                     _ => {
                         log::debug!("Ignoring stream of type {:?}", stream_type);

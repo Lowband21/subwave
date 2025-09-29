@@ -6,15 +6,18 @@ use iced::{
     advanced::{self, layout, widget::Widget},
     ContentFit, Element, Event, Length, Rectangle, Size,
 };
+use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+
+pub type VideoHandle = Rc<RefCell<Option<Box<SubsurfaceVideo>>>>;
 
 /// A video player widget that reserves space in iced's layout
 /// The actual rendering happens through a Wayland subsurface
 ///
 /// Note: This widget requires the wgpu renderer and Wayland platform
 pub struct VideoPlayer<'a, Message, Theme = iced::Theme> {
-    video: &'a Arc<Mutex<Option<Box<SubsurfaceVideo>>>>,
+    video: &'a VideoHandle,
     _content_fit: ContentFit,
     width: Length,
     height: Length,
@@ -26,7 +29,7 @@ pub struct VideoPlayer<'a, Message, Theme = iced::Theme> {
 
 impl<'a, Message, Theme> VideoPlayer<'a, Message, Theme> {
     /// Create a new video player widget for the given video
-    pub fn new(video: &'a Arc<Mutex<Option<Box<SubsurfaceVideo>>>>) -> Self {
+    pub fn new(video: &'a VideoHandle) -> Self {
         Self {
             video,
             _content_fit: ContentFit::Contain,
@@ -40,7 +43,7 @@ impl<'a, Message, Theme> VideoPlayer<'a, Message, Theme> {
     }
 
     /// Create a new video player widget from a direct video reference
-    pub fn from(video: &'a Arc<Mutex<Option<Box<SubsurfaceVideo>>>>) -> Self {
+    pub fn from(video: &'a VideoHandle) -> Self {
         Self::new(video)
     }
 
@@ -109,7 +112,7 @@ where
     /// Use the widget's requested size (Fill means use all available space)
     /// Don't use video dimensions for widget sizing - the video will be fitted within the widget
     fn layout(
-        &self,
+        &mut self,
         _tree: &mut advanced::widget::Tree,
         _renderer: &iced_wgpu::Renderer,
         limits: &layout::Limits,
@@ -133,7 +136,7 @@ where
         // Handle redraw events to check for position updates
         if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
             // Check if video is available and process position updates
-            if let Ok(guard) = self.video.lock() {
+            if let Ok(guard) = self.video.try_borrow() {
                 if let Some(video) = guard.as_ref() {
                     // Only emit new frame message if the video is playing
                     // and enough time has passed since last update (100ms throttling)
@@ -169,7 +172,7 @@ where
         _cursor: advanced::mouse::Cursor,
         _viewport: &Rectangle,
     ) {
-        let video_available = if let Ok(guard) = self.video.lock() {
+        let video_available = if let Ok(guard) = self.video.try_borrow() {
             guard.is_some()
         } else {
             false
@@ -180,7 +183,7 @@ where
             return;
         }
 
-        let initialized = if let Ok(guard) = self.video.lock() {
+        let initialized = if let Ok(guard) = self.video.try_borrow() {
             if let Some(video) = guard.as_ref() {
                 // Check if the video has a subsurface (indicates it's initialized)
                 video.get_subsurface().is_some()
@@ -210,7 +213,7 @@ where
 
         // TODO: Calculate and pass the correct aspect ratio to the video player pipeline seemlessly
         // We should probably add the element to the pipeline on demand if the user changes the default fit mode
-        if let Ok(guard) = self.video.lock() {
+        if let Ok(guard) = self.video.try_borrow() {
             if let Some(video) = guard.as_ref() {
                 if let Some(resolution) = video.resolution() {
                     // Validate video dimensions - must be reasonable
@@ -256,7 +259,7 @@ where
                         // Pump updates (bus commands + subtitles) from the UI thread each draw
                         // We need a mutable reference to call tick()
                         drop(guard);
-                        if let Ok(mut guard2) = self.video.lock() {
+                        if let Ok(mut guard2) = self.video.try_borrow_mut() {
                             if let Some(video_mut) = guard2.as_deref_mut() {
                                 video_mut.tick();
                             }
@@ -301,7 +304,7 @@ fn initialize<'a, Message, Theme>(
         );
 
         // Initialize the video with Wayland integration and bounds
-        let init_result = if let Ok(mut guard) = video_player.video.lock() {
+        let init_result = if let Ok(mut guard) = video_player.video.try_borrow_mut() {
             if let Some(video) = guard.as_deref_mut() {
                 video.init_wayland(our_integration, init_bounds)
             } else {
@@ -316,7 +319,7 @@ fn initialize<'a, Message, Theme>(
                 log::debug!("Wayland integration initialized successfully");
 
                 // Start playback now that we're initialized and visible
-                if let Ok(guard) = video_player.video.lock() {
+                if let Ok(guard) = video_player.video.try_borrow() {
                     if let Some(video) = guard.as_ref() {
                         // Try to start playback
                         if let Err(e) = video.play() {

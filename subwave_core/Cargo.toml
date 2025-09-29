@@ -2,10 +2,10 @@
 name = "subwave_core"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 gstreamer.workspace = true
-gstreamer-app.workspace = true
 
 url.workspace = true
 thiserror.workspace = true

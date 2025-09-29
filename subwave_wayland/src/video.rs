@@ -30,7 +30,6 @@ impl Video for SubsurfaceVideo {
             uri: uri.clone(),
             pipeline: None,
             subsurface: None,
-            video_props: None,
             duration: None,
             speed: 1.0,
             looping: false,
@@ -48,6 +47,9 @@ impl Video for SubsurfaceVideo {
             audio_index_to_stream_id: Vec::new(),
             subtitle_index_to_stream_id: Vec::new(),
             selected_stream_ids: Vec::new(),
+            is_buffering: false,
+            buffering_percent: 100,
+            user_paused: false,
             pending_state: None,
             last_position_update: Instant::now(),
         })))
@@ -149,7 +151,13 @@ impl Video for SubsurfaceVideo {
     }
 
     fn set_paused(&mut self, paused: bool) {
-        if let Some(p) = self.0.read().pipeline.clone() {
+        let pipeline = {
+            let mut state = self.0.write();
+            state.user_paused = paused;
+            state.pipeline.clone()
+        };
+
+        if let Some(p) = pipeline {
             let _ = if paused { p.pause() } else { p.play() };
         }
     }
@@ -296,7 +304,7 @@ impl Video for SubsurfaceVideo {
             .pipeline
             .as_ref()
             .map(|p| p.pipeline.as_ref().clone())
-            .unwrap_or_else(gst::Pipeline::default)
+            .unwrap_or_default()
     }
 }
 
@@ -306,7 +314,6 @@ impl SubsurfaceVideo {
             uri: uri.clone(),
             pipeline: None,
             subsurface: None,
-            video_props: None,
             duration: None,
             speed: 1.0,
             looping: false,
@@ -327,6 +334,9 @@ impl SubsurfaceVideo {
             audio_index_to_stream_id: Vec::new(),
             subtitle_index_to_stream_id: Vec::new(),
             selected_stream_ids: Vec::new(),
+            is_buffering: false,
+            buffering_percent: 100,
+            user_paused: false,
             pending_state: None,
             last_position_update: Instant::now(),
         };
@@ -398,6 +408,42 @@ impl SubsurfaceVideo {
                                         .query_duration::<gst::ClockTime>()
                                         .map(|d| Duration::from_nanos(d.nseconds()));
                                     if tx.send(Box::new(move |s: &mut Internal| s.duration = dur)).is_err() {
+                                        log::debug!("[bus] receiver dropped; exiting bus thread");
+                                        break;
+                                    }
+                                }
+                                MessageView::Buffering(buffering) => {
+                                    let percent = buffering.percent();
+                                    log::debug!("[buffering] {}%", percent);
+                                    let tx_buffer = tx.clone();
+                                    if tx_buffer
+                                        .send(Box::new(move |state: &mut Internal| {
+                                            let was_buffering = state.is_buffering;
+                                            let buffering_now = percent < 100;
+                                            state.is_buffering = buffering_now;
+                                            state.buffering_percent = percent;
+
+                                            if let Some(pipeline) = state.pipeline.clone() {
+                                                if buffering_now && !was_buffering && !state.user_paused {
+                                                    if let Err(err) = pipeline.pause() {
+                                                        log::warn!(
+                                                            "Failed to pause pipeline during buffering: {err:?}"
+                                                        );
+                                                    }
+                                                } else if !buffering_now
+                                                    && was_buffering
+                                                    && !state.user_paused
+                                                {
+                                                    if let Err(err) = pipeline.play() {
+                                                        log::warn!(
+                                                            "Failed to resume pipeline after buffering: {err:?}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }))
+                                        .is_err()
+                                    {
                                         log::debug!("[bus] receiver dropped; exiting bus thread");
                                         break;
                                     }
@@ -715,6 +761,11 @@ impl SubsurfaceVideo {
         if let Some(h) = handle {
             let _ = h.join();
         }
+        let subsurface = self.0.read().subsurface.clone();
+        if let Some(s) = subsurface {
+            let _ = s.clear_subtitle();
+        }
+
         // Stop pipeline
         if let Some(p) = self.0.read().pipeline.clone() {
             p.stop()?;
@@ -776,23 +827,6 @@ impl SubsurfaceVideo {
             .unwrap_or(false)
     }
 
-    fn position(&self) -> Duration {
-        let inner = self.0.read();
-        if let Some(pipeline) = &inner.pipeline {
-            // Query position when pipeline is stable
-            if let Some(pos) = pipeline.pipeline.query_position::<gst::ClockTime>() {
-                
-                //pipeline.last_valid_position = Some(pos_dur);
-                Duration::from_nanos(pos.nseconds())
-            } else {
-                // Return last known position if query fails
-                pipeline.last_valid_position.unwrap_or(Duration::ZERO)
-            }
-        } else {
-            Duration::ZERO
-        }
-    }
-
     pub fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
         if let Some(p) = self.0.read().pipeline.clone() {
             p.seek(position, accurate)
@@ -825,8 +859,17 @@ impl SubsurfaceVideo {
     }
 
     pub fn set_video_size_position(&self, x_offset: i32, y_offset: i32, width: i32, height: i32) {
-        if let Some(p) = &self.0.read().pipeline {
+        let (pipeline, subsurface) = {
+            let guard = self.0.read();
+            (guard.pipeline.clone(), guard.subsurface.clone())
+        };
+
+        if let Some(p) = pipeline {
             p.set_render_rectangle(x_offset, y_offset, width, height);
+        }
+
+        if let Some(s) = subsurface {
+            s.set_size(width, height);
         }
     }
 
