@@ -1,0 +1,190 @@
+name: Rust CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: Build
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+      max-parallel: 3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # Install system dependencies per OS for glib/gstreamer and pkg-config
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libglib2.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install pkg-config glib gstreamer gst-plugins-base
+
+      # On Windows install official MSVC GStreamer runtime + devel packages
+      - name: Install GStreamer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '1.26.6'
+          $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$version/msvc"
+          $msis = @(
+            "gstreamer-1.0-msvc-x86_64-$version.msi",
+            "gstreamer-1.0-devel-msvc-x86_64-$version.msi"
+          )
+          $installRoot = 'C:\gstreamer'
+          $expectedPrefix = Join-Path -Path $installRoot -ChildPath '1.0\msvc_x86_64'
+          New-Item -ItemType Directory -Force -Path $expectedPrefix | Out-Null
+          foreach ($msi in $msis) {
+            $url = "$baseUrl/$msi"
+            $outPath = Join-Path $env:RUNNER_TEMP $msi
+            Write-Host "Downloading $url"
+            Invoke-WebRequest -Uri $url -OutFile $outPath -UseBasicParsing
+            Write-Host "Installing $msi"
+            Start-Process msiexec.exe -Wait -ArgumentList @('/i', $outPath, '/quiet', '/norestart', "INSTALLDIR=$expectedPrefix")
+          }
+          $knownPrefixes = @(
+            $expectedPrefix,
+            (Join-Path -Path $installRoot -ChildPath 'msvc_x86_64'),
+            (Join-Path -Path $installRoot -ChildPath '1.0\msvc_x86_64\1.0\msvc_x86_64'),
+            (Join-Path $env:ProgramFiles 'GStreamer\1.0\msvc_x86_64'),
+            (Join-Path ${env:ProgramFiles(x86)} 'GStreamer\1.0\msvc_x86_64')
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          $prefix = $null
+          foreach ($candidate in $knownPrefixes) {
+            if (Test-Path (Join-Path $candidate 'bin\pkg-config.exe')) {
+              $prefix = $candidate
+              break
+            }
+          }
+          if (-not $prefix) {
+            Write-Warning "Explicit prefix '$expectedPrefix' missing, probing common locations..."
+            $searchRoots = @('C:\gstreamer', 'C:\Program Files', 'C:\Program Files (x86)', $env:LOCALAPPDATA, $env:ProgramData) | Where-Object { $_ -and (Test-Path $_) }
+            foreach ($root in $searchRoots) {
+              $match = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path (Join-Path $_.FullName 'bin\pkg-config.exe') } |
+                Select-Object -First 1
+              if ($match) {
+                $prefix = $match.FullName
+                break
+              }
+            }
+          }
+          if (-not $prefix) {
+            throw "Unable to locate GStreamer installation after MSI install"
+          }
+          $segments = $prefix.TrimEnd('\').Split('\')
+          $suffixA = '1.0'
+          $suffixB = 'msvc_x86_64'
+          while ($segments.Length -ge 4 -and
+            $segments[$segments.Length - 1] -eq $suffixB -and
+            $segments[$segments.Length - 2] -eq $suffixA -and
+            $segments[$segments.Length - 3] -eq $suffixB -and
+            $segments[$segments.Length - 4] -eq $suffixA) {
+            $segments = $segments[0..($segments.Length - 3)]
+          }
+          $prefix = ($segments -join '\')
+          Write-Host "Using GStreamer prefix: $prefix"
+          $gstBin = Join-Path $prefix 'bin'
+          $gstLib = Join-Path $prefix 'lib'
+          $pkgConfigDirs = @(
+            (Join-Path -Path $gstLib -ChildPath 'pkgconfig')
+            (Join-Path -Path $gstLib -ChildPath 'gstreamer-1.0\pkgconfig')
+          ) | Where-Object { Test-Path $_ }
+          if (-not $pkgConfigDirs -or $pkgConfigDirs.Count -eq 0) {
+            throw "pkg-config directories not found under '$gstLib'"
+          }
+          $pkgConfigPath = ($pkgConfigDirs -join ';')
+          $pkgConfigExe = Join-Path $gstBin 'pkg-config.exe'
+          if (-not (Test-Path $pkgConfigExe)) {
+            throw "pkg-config executable not found under '$gstBin'"
+          }
+          "${gstBin}" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GST_SDK_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG_PATH=$pkgConfigPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG_SYSROOT_DIR=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG=$pkgConfigExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - uses: moonrepo/setup-rust@v1
+        if: runner.os != 'Windows'
+        env:
+          # Give cargo-binstall higher GitHub API limits and disable telemetry
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_BINSTALL_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_BINSTALL_DISABLE_TELEMETRY: "true"
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy,rustfmt
+          bins: cargo-audit,cargo-deny
+      - uses: moonrepo/setup-rust@v1
+        if: runner.os == 'Windows'
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy,rustfmt
+          profile: minimal
+      - if: runner.os != 'Windows'
+        run: cargo fmt --all --check
+      - if: runner.os != 'Windows'
+        run: cargo audit
+      - if: runner.os != 'Windows'
+        run: cargo deny check
+      - name: Clippy (non-Windows)
+        if: runner.os != 'Windows'
+        run: cargo clippy --workspace --target ${{ matrix.target }} -- -W warnings
+      - name: Build (non-Windows)
+        if: runner.os != 'Windows'
+        run: cargo build --workspace --all-features --target ${{ matrix.target }}
+
+      # Verify pkg-config finds GStreamer (Windows)
+      - name: Verify pkg-config and libs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pkg-config --version
+          pkg-config --print-errors --exists glib-2.0 'glib-2.0 >= 2.56' gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0
+          "glib:        $(pkg-config --modversion glib-2.0)" | Write-Host
+          "gstreamer:   $(pkg-config --modversion gstreamer-1.0)" | Write-Host
+          "gst-app:     $(pkg-config --modversion gstreamer-app-1.0)" | Write-Host
+          "gst-video:   $(pkg-config --modversion gstreamer-video-1.0)" | Write-Host
+
+      # Run cargo in Windows shell with MinGW toolchain and official GStreamer
+      - name: Fmt (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo fmt --all --check
+
+      - name: Clippy (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo clippy --workspace --target ${{ matrix.target }} -- -W warnings
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo build --workspace --all-features --target ${{ matrix.target }}
+  #     - name: Build documentation (TODO)
+  #       run: cargo doc --workspace --no-deps --all-features -- -D warnings

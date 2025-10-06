@@ -2,7 +2,14 @@
 
 Wayland‑first video playback for Iced via GStreamer. A unified API prefers a Wayland subsurface backend and falls back to an appsink + wgpu path when Wayland isn’t available.
 
-> Heads-up: the Wayland integration uses a feature from my Iced fork called `wayland-hack`, which exposes the Wayland handles required for managing and creating subsurfaces. You'll note, if from the name of the feature alone, that further work is needed in Iced for correctly implementing the Wayland integration despite the current functional status.
+<details>
+  <summary><strong>Wayland caveat</strong></summary>
+
+The Wayland integration uses a feature from my Iced fork called `wayland-hack`, which exposes the Wayland handles required for managing and creating subsurfaces.
+
+I plan to rewrite the integration to expose a proper API when I have time.
+
+</details>
 
 **Status**: early/experimental. APIs will change.
 
@@ -15,19 +22,6 @@ Wayland‑first video playback for Iced via GStreamer. A unified API prefers a W
 **Relationship to Ferrix**
 - subwave is developed primarily to power video playback for Ferrix, a performance-first, self‑hosted media server and desktop player focused on responsive browsing and playback matching the performance and compatibility of native video players. Ferrix emphasizes desktop feel, aiming to be enjoyable to use, pleasant to look at, and to support HDR playback by leveraging bleeding-edge Wayland + GStreamer integration.
 
-**Quick Start (unified)**
-```rust
-use subwave_unified::video::SubwaveVideo;
-
-// Initialize GStreamer in your app before creating videos
-// gstreamer::init().unwrap();
-
-let url = url::Url::parse("file:///path/to/video.mkv").unwrap();
-let video = SubwaveVideo::new(&url).expect("create video");
-
-// In an Iced view, construct a backend-agnostic widget
-// let element = video.widget::<Message, iced::Theme>(iced::ContentFit::Contain, None);
-```
 **Requirements**:
 - Base GStreamer: playbin3 + videoconvertscale + appsink
 - HDR Passthrough: vapostproc and waylandsink built from 1.27.x development releases
