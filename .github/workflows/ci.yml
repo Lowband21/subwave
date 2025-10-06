@@ -40,93 +40,13 @@ jobs:
           brew update
           brew install pkg-config glib gstreamer gst-plugins-base
 
-      # On Windows install official MSVC GStreamer runtime + devel packages
-      - name: Install GStreamer (Windows)
+      # On Windows leverage GitHub action to install official MSVC GStreamer runtime + devel packages
+      - name: Setup GStreamer (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = '1.26.6'
-          $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$version/msvc"
-          $msis = @(
-            "gstreamer-1.0-msvc-x86_64-$version.msi",
-            "gstreamer-1.0-devel-msvc-x86_64-$version.msi"
-          )
-          $installRoot = 'C:\gstreamer'
-          $expectedPrefix = Join-Path -Path $installRoot -ChildPath '1.0\msvc_x86_64'
-          New-Item -ItemType Directory -Force -Path $expectedPrefix | Out-Null
-          foreach ($msi in $msis) {
-            $url = "$baseUrl/$msi"
-            $outPath = Join-Path $env:RUNNER_TEMP $msi
-            Write-Host "Downloading $url"
-            Invoke-WebRequest -Uri $url -OutFile $outPath -UseBasicParsing
-            Write-Host "Installing $msi"
-            Start-Process msiexec.exe -Wait -ArgumentList @('/i', $outPath, '/quiet', '/norestart', "INSTALLDIR=$expectedPrefix")
-          }
-          $knownPrefixes = @(
-            $expectedPrefix,
-            (Join-Path -Path $installRoot -ChildPath 'msvc_x86_64'),
-            (Join-Path -Path $installRoot -ChildPath '1.0\msvc_x86_64\1.0\msvc_x86_64'),
-            (Join-Path $env:ProgramFiles 'GStreamer\1.0\msvc_x86_64'),
-            (Join-Path ${env:ProgramFiles(x86)} 'GStreamer\1.0\msvc_x86_64')
-          ) | Where-Object { $_ -and (Test-Path $_) }
-          $prefix = $null
-          foreach ($candidate in $knownPrefixes) {
-            if (Test-Path (Join-Path $candidate 'bin\pkg-config.exe')) {
-              $prefix = $candidate
-              break
-            }
-          }
-          if (-not $prefix) {
-            Write-Warning "Explicit prefix '$expectedPrefix' missing, probing common locations..."
-            $searchRoots = @('C:\gstreamer', 'C:\Program Files', 'C:\Program Files (x86)', $env:LOCALAPPDATA, $env:ProgramData) | Where-Object { $_ -and (Test-Path $_) }
-            foreach ($root in $searchRoots) {
-              $match = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { Test-Path (Join-Path $_.FullName 'bin\pkg-config.exe') } |
-                Select-Object -First 1
-              if ($match) {
-                $prefix = $match.FullName
-                break
-              }
-            }
-          }
-          if (-not $prefix) {
-            throw "Unable to locate GStreamer installation after MSI install"
-          }
-          $segments = $prefix.TrimEnd('\').Split('\')
-          $suffixA = '1.0'
-          $suffixB = 'msvc_x86_64'
-          while ($segments.Length -ge 4 -and
-            $segments[$segments.Length - 1] -eq $suffixB -and
-            $segments[$segments.Length - 2] -eq $suffixA -and
-            $segments[$segments.Length - 3] -eq $suffixB -and
-            $segments[$segments.Length - 4] -eq $suffixA) {
-            $segments = $segments[0..($segments.Length - 3)]
-          }
-          $prefix = ($segments -join '\')
-          Write-Host "Using GStreamer prefix: $prefix"
-          $gstBin = Join-Path $prefix 'bin'
-          $gstLib = Join-Path $prefix 'lib'
-          $pkgConfigDirs = @(
-            (Join-Path -Path $gstLib -ChildPath 'pkgconfig')
-            (Join-Path -Path $gstLib -ChildPath 'gstreamer-1.0\pkgconfig')
-          ) | Where-Object { Test-Path $_ }
-          if (-not $pkgConfigDirs -or $pkgConfigDirs.Count -eq 0) {
-            throw "pkg-config directories not found under '$gstLib'"
-          }
-          $pkgConfigPath = ($pkgConfigDirs -join ';')
-          $pkgConfigExe = Join-Path $gstBin 'pkg-config.exe'
-          if (-not (Test-Path $pkgConfigExe)) {
-            throw "pkg-config executable not found under '$gstBin'"
-          }
-          "${gstBin}" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "GST_SDK_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_PATH=$pkgConfigPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_SYSROOT_DIR=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG=$pkgConfigExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        uses: marcpabst/setup-gstreamer@v.1.5.3
+        with:
+          version: '1.26.6'
+          arch: x86_64
 
       - uses: moonrepo/setup-rust@v1
         if: runner.os != 'Windows'

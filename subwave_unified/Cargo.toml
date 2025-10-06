@@ -9,7 +9,6 @@ license.workspace = true
 subwave_core = { path = "../subwave_core" }
 # concrete backends
 subwave_appsink = { path = "../subwave_appsink" }
-subwave_wayland = { path = "../subwave_wayland" }
 
 gstreamer.workspace = true
 
@@ -19,3 +18,10 @@ iced_wgpu.workspace = true
 
 log.workspace = true
 url.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+subwave_wayland = { path = "../subwave_wayland", optional = true, default-features = false }
+
+[features]
+default = ["wayland"]
+wayland = ["dep:subwave_wayland"]

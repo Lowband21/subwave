@@ -1,14 +1,20 @@
 use gstreamer::Pipeline;
 use iced::{Element, Length};
 use log::warn;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use subwave_appsink::video::AppsinkVideo;
-use subwave_core::types::PendingState;
 use subwave_core::video::types::{AudioTrack, SubtitleTrack};
 use subwave_core::video::video_trait::Video as VideoTrait;
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+use std::cell::RefCell;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+use std::rc::Rc;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+use std::sync::{Arc, Mutex};
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+use subwave_core::types::PendingState;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
 use subwave_wayland::{SubsurfaceVideo, VideoHandle};
 
 /// Which backend to use
@@ -63,6 +69,7 @@ pub enum SubwaveVideo {
         cfg: SubwaveConfig,
         inner: Box<AppsinkVideo>,
     },
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     Wayland {
         uri: url::Url,
         cfg: SubwaveConfig,
@@ -73,6 +80,7 @@ pub enum SubwaveVideo {
 }
 
 impl SubwaveVideo {
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     fn with_wayland<R>(&self, f: impl FnOnce(&SubsurfaceVideo) -> R) -> Option<R> {
         match self {
             SubwaveVideo::Wayland { handle, .. } => handle
@@ -83,6 +91,7 @@ impl SubwaveVideo {
         }
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     fn with_wayland_mut<R>(&mut self, f: impl FnOnce(&mut SubsurfaceVideo) -> R) -> Option<R> {
         match self {
             SubwaveVideo::Wayland { handle, .. } => handle
@@ -117,6 +126,7 @@ impl SubwaveVideo {
                     inner: Box::new(v),
                 })
             }
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             BackendPreference::ForceWayland => {
                 let v = SubsurfaceVideo::new(uri)?;
                 Ok(SubwaveVideo::Wayland {
@@ -124,6 +134,18 @@ impl SubwaveVideo {
                     cfg,
                     handle: Rc::new(RefCell::new(Some(Box::new(v)))),
                     pending: Arc::new(Mutex::new(None)),
+                })
+            }
+            #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+            BackendPreference::ForceWayland => {
+                warn!("Wayland backend requested on non-Linux platform; falling back to Appsink");
+                let v = AppsinkVideo::new(uri)?;
+                Ok(SubwaveVideo::Appsink {
+                    uri: uri.clone(),
+                    cfg: SubwaveConfig {
+                        preference: BackendPreference::ForceAppsink,
+                    },
+                    inner: Box::new(v),
                 })
             }
             BackendPreference::Auto => unreachable!(),
@@ -139,6 +161,7 @@ impl SubwaveVideo {
     pub fn set_paused(&mut self, paused: bool) {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.set_paused(paused),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 self.with_wayland_mut(|video| video.set_paused(paused));
             }
@@ -148,6 +171,7 @@ impl SubwaveVideo {
     pub fn paused(&self) -> bool {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.paused(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 self.with_wayland(|video| video.paused()).unwrap_or(true)
             }
@@ -165,6 +189,7 @@ impl SubwaveVideo {
     pub fn set_speed(&mut self, speed: f64) -> Result<(), subwave_core::Error> {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.set_speed(speed),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland_mut(|video| video.set_speed(speed))
                 .unwrap_or(Ok(())),
@@ -174,6 +199,7 @@ impl SubwaveVideo {
     pub fn position(&self) -> Duration {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.position(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.position())
                 .unwrap_or(Duration::ZERO),
@@ -183,6 +209,7 @@ impl SubwaveVideo {
     pub fn duration(&self) -> Duration {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.duration(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.duration())
                 .unwrap_or(Duration::ZERO),
@@ -192,6 +219,7 @@ impl SubwaveVideo {
     pub fn seek(&mut self, position: Duration, accurate: bool) -> Result<(), subwave_core::Error> {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.seek(position, accurate),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland_mut(|video| video.seek(position, accurate))
                 .unwrap_or(Err(subwave_core::Error::InvalidState)),
@@ -201,6 +229,7 @@ impl SubwaveVideo {
     pub fn set_volume(&mut self, volume: f64) {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.set_volume(volume),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 if let Some(Err(err)) =
                     self.with_wayland_mut(|video| SubsurfaceVideo::set_volume(video, volume))
@@ -214,6 +243,7 @@ impl SubwaveVideo {
     pub fn volume(&self) -> f64 {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.volume(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 self.with_wayland(|video| video.volume()).unwrap_or(1.0)
             }
@@ -223,6 +253,7 @@ impl SubwaveVideo {
     pub fn set_muted(&mut self, muted: bool) {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.set_muted(muted),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 self.with_wayland_mut(|video| video.set_muted(muted));
             }
@@ -232,6 +263,7 @@ impl SubwaveVideo {
     pub fn has_video(&self) -> bool {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.has_video(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.has_video())
                 .unwrap_or(false),
@@ -242,6 +274,7 @@ impl SubwaveVideo {
     pub fn size(&self) -> (i32, i32) {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.size(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 self.with_wayland(|video| video.size()).unwrap_or((0, 0))
             }
@@ -252,6 +285,7 @@ impl SubwaveVideo {
     pub fn audio_tracks(&mut self) -> Vec<AudioTrack> {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.audio_tracks(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland_mut(|video| video.audio_tracks())
                 .unwrap_or_default(),
@@ -261,6 +295,7 @@ impl SubwaveVideo {
     pub fn current_audio_track(&self) -> i32 {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.current_audio_track(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.current_audio_track())
                 .unwrap_or(0),
@@ -270,6 +305,7 @@ impl SubwaveVideo {
     pub fn select_audio_track(&mut self, index: i32) -> Result<(), subwave_core::Error> {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.select_audio_track(index),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland_mut(|video| video.select_audio_track(index))
                 .unwrap_or(Err(subwave_core::Error::InvalidState)),
@@ -279,6 +315,7 @@ impl SubwaveVideo {
     pub fn subtitle_tracks(&mut self) -> Vec<SubtitleTrack> {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.subtitle_tracks(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland_mut(|video| video.subtitle_tracks())
                 .unwrap_or_default(),
@@ -288,6 +325,7 @@ impl SubwaveVideo {
     pub fn current_subtitle_track(&self) -> Option<i32> {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.current_subtitle_track(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.current_subtitle_track())
                 .unwrap_or(None),
@@ -297,6 +335,7 @@ impl SubwaveVideo {
     pub fn select_subtitle_track(&mut self, index: Option<i32>) -> Result<(), subwave_core::Error> {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.select_subtitle_track(index),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland_mut(|video| video.select_subtitle_track(index))
                 .unwrap_or(Err(subwave_core::Error::InvalidState)),
@@ -306,6 +345,7 @@ impl SubwaveVideo {
     pub fn subtitles_enabled(&self) -> bool {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.subtitles_enabled(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.subtitles_enabled())
                 .unwrap_or(false),
@@ -315,6 +355,7 @@ impl SubwaveVideo {
     pub fn set_subtitles_enabled(&mut self, enabled: bool) {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.set_subtitles_enabled(enabled),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 if let Some(Err(err)) = self.with_wayland_mut(|video| {
                     SubsurfaceVideo::set_subtitles_enabled(video, enabled)
@@ -346,6 +387,7 @@ impl SubwaveVideo {
                 }
                 w.into()
             }
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland {
                 handle, pending, ..
             } => {
@@ -402,6 +444,7 @@ impl SubwaveVideo {
     pub fn config(&self) -> SubwaveConfig {
         match self {
             SubwaveVideo::Appsink { cfg, .. } => *cfg,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { cfg, .. } => *cfg,
         }
     }
@@ -410,6 +453,7 @@ impl SubwaveVideo {
     pub fn uri(&self) -> &url::Url {
         match self {
             SubwaveVideo::Appsink { uri, .. } => uri,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { uri, .. } => uri,
         }
     }
@@ -418,6 +462,7 @@ impl SubwaveVideo {
     pub fn backend(&self) -> BackendPreference {
         match self {
             SubwaveVideo::Appsink { .. } => BackendPreference::ForceAppsink,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => BackendPreference::ForceWayland,
         }
     }
@@ -427,11 +472,13 @@ impl SubwaveVideo {
         let position = self.position();
         let speed = match self {
             SubwaveVideo::Appsink { inner, .. } => inner.speed(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self.with_wayland(|video| video.speed()).unwrap_or(1.0),
         };
         let volume = self.volume();
         let muted = match self {
             SubwaveVideo::Appsink { inner, .. } => inner.muted(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => {
                 self.with_wayland(|video| video.muted()).unwrap_or(false)
             }
@@ -441,6 +488,7 @@ impl SubwaveVideo {
         let subtitles_enabled = self.subtitles_enabled();
         let subtitle_url = match self {
             SubwaveVideo::Appsink { inner, .. } => inner.subtitle_url(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.subtitle_url())
                 .unwrap_or(None),
@@ -498,6 +546,7 @@ impl SubwaveVideo {
             // Still update config
             match self {
                 SubwaveVideo::Appsink { cfg, .. } => cfg.preference = preference,
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
                 SubwaveVideo::Wayland { cfg, .. } => cfg.preference = preference,
             }
             return Ok(());
@@ -516,6 +565,7 @@ impl SubwaveVideo {
                 };
                 Ok(())
             }
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             BackendPreference::ForceWayland => {
                 let v = SubsurfaceVideo::new(&uri)?;
                 // Queue state into Wayland video to apply after init
@@ -538,6 +588,17 @@ impl SubwaveVideo {
                 };
                 Ok(())
             }
+            #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+            BackendPreference::ForceWayland => {
+                warn!("Wayland backend requested on non-Linux platform; staying on Appsink");
+                // Ensure the stored preference matches actual backend
+                match self {
+                    SubwaveVideo::Appsink { cfg, .. } => {
+                        cfg.preference = BackendPreference::ForceAppsink;
+                    }
+                }
+                Ok(())
+            }
             BackendPreference::Auto => {
                 let pref = if is_wayland() {
                     BackendPreference::ForceWayland
@@ -555,6 +616,7 @@ impl SubwaveVideo {
     pub fn pipeline(&self) -> Pipeline {
         match self {
             SubwaveVideo::Appsink { inner, .. } => inner.pipeline(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => self
                 .with_wayland(|video| video.pipeline())
                 .unwrap_or_default(),
@@ -566,6 +628,7 @@ impl std::fmt::Debug for SubwaveVideo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SubwaveVideo::Appsink { .. } => f.debug_struct("SubwaveVideo::Appsink").finish(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             SubwaveVideo::Wayland { .. } => f.debug_struct("SubwaveVideo::Wayland").finish(),
         }
     }

@@ -1,6 +1,13 @@
+<div align="center">
+
 # Subwave
 
+[![CI Status](https://img.shields.io/github/actions/workflow/status/Lowband21/Subwave/ci.yml?branch=main&event=push&label=ci)](https://github.com/Lowband21/Subwave/actions)
+[![License](https://img.shields.io/badge/MIT-Apache-blue)](https://github.com/iced-rs/iced/blob/master/LICENSE)
+
 Wayland‑first video playback for Iced via GStreamer. A unified API prefers a Wayland subsurface backend and falls back to an appsink + wgpu path when Wayland isn’t available.
+
+</div>
 
 <details>
   <summary><strong>Wayland caveat</strong></summary>
