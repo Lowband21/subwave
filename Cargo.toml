@@ -34,7 +34,6 @@ iced = { git = "https://github.com/Lowband21/iced-ferrix.git", default-features 
   "wgpu",
   "image",
   "thread-pool",
-  "prefer_10bit",
   "wayland-hack",
 ] }
 iced_wgpu = { git = "https://github.com/Lowband21/iced-ferrix.git" }
