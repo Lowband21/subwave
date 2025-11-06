@@ -62,6 +62,9 @@ pub(crate) struct Internal {
     // Pending playback state to apply when pipeline is ready
     pub(crate) pending_state: Option<PendingState>,
 
+    // Pending HTTP headers to apply to pipeline when available
+    pub(crate) pending_http_headers: Option<Vec<(String, String)>>,
+
     // Throttling
     pub(crate) last_position_update: Instant,
 }

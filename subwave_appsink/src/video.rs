@@ -15,6 +15,59 @@ use subwave_core::video::video_trait::Video;
 pub struct AppsinkVideo(pub(crate) RwLock<Internal>);
 
 impl AppsinkVideo {
+    fn build_pipeline_with_headers_vec(
+        uri: &url::Url,
+        headers: Option<&[(String, String)]>,
+    ) -> Result<(gst::Pipeline, gst_app::AppSink), Error> {
+        let video_sink_bin = match Self::build_video_sink() {
+            Ok(sink) => sink,
+            Err(_) => gst::parse::bin_from_description(
+                "videoconvertscale n-threads=0 ! appsink name=subwave_appsink drop=true caps=\"video/x-raw,format=(string){NV12},pixel-aspect-ratio=1/1\"",
+                true,
+            )?
+            .upcast(),
+        };
+
+        let pipeline = gst::ElementFactory::make("playbin3")
+            .property("uri", uri.as_str())
+            .property("video-sink", &video_sink_bin)
+            .property("message-forward", true)
+            .property("buffer-duration", 5_000_000_000i64)
+            .property("buffer-size", 3_000_000i32)
+            .build()?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| Error::Cast)?;
+
+        // Apply http-headers context before any state transitions
+        if let Some(h) = headers {
+            subwave_core::http::set_http_headers_on_pipeline(&pipeline, h);
+        }
+
+        // Add scaletempo for pitch correction during variable playback speed
+        if let Ok(scaletempo) = gst::ElementFactory::make("scaletempo")
+            .name("pitch-corrector")
+            .build()
+        {
+            pipeline.set_property("audio-filter", &scaletempo);
+            log::info!("Enabled pitch correction for variable playback speed");
+        } else {
+            log::warn!("scaletempo element not available - pitch correction disabled");
+        }
+
+        let video_sink_opt: Option<gst::Element> = pipeline.property("video-sink");
+        let video_sink = match video_sink_opt {
+            Some(e) => e,
+            None => return Err(Error::Cast),
+        };
+        let video_sink_bin = video_sink.downcast::<gst::Bin>().map_err(|_| Error::Cast)?;
+        let video_sink = video_sink_bin
+            .by_name("subwave_appsink")
+            .ok_or(Error::Cast)?
+            .downcast::<gst_app::AppSink>()
+            .map_err(|_| Error::Cast)?;
+
+        Ok((pipeline, video_sink))
+    }
     /// Creates a video sink bin with proper buffering for network streams
     fn build_video_sink() -> Result<gst::Element, Error> {
         let bin = gst::Bin::builder().name("video-sink-bin").build();
@@ -384,6 +437,14 @@ impl AppsinkVideo {
     pub(crate) fn get_mut(&mut self) -> impl DerefMut<Target = Internal> + '_ {
         self.0.get_mut().expect("lock")
     }
+
+    /// Set HTTP headers for HTTP-based sources via GStreamer "http-headers" context.
+    /// Applies the context to the underlying pipeline so that HTTP elements (e.g. souphttpsrc,
+    /// adaptivedemux segment fetchers) can use them for requests.
+    pub fn set_http_headers(&mut self, headers: &[(impl AsRef<str>, impl AsRef<str>)]) {
+        let pipeline = self.get_mut().source.clone();
+        subwave_core::http::set_http_headers_on_pipeline(&pipeline, headers);
+    }
 }
 
 impl Video for AppsinkVideo {
@@ -393,66 +454,7 @@ impl Video for AppsinkVideo {
     /// Note that live sources will report the duration to be zero.
     fn new(uri: &url::Url) -> Result<Self, Error> {
         gst::init()?;
-
-        //let is_network_stream = uri.scheme() == "http" || uri.scheme() == "https";
-
-        // Create video sink bin
-        let video_sink_bin = match Self::build_video_sink() {
-            Ok(sink) => sink,
-            Err(e) => {
-                log::error!(
-                    "Failed to create buffered sink, falling back to string pipeline builder: {:?}",
-                    e
-                );
-                gst::parse::bin_from_description(
-                        "videoconvertscale n-threads=0 ! appsink name=subwave_appsink drop=true caps=\"video/x-raw,format=(string){NV12},pixel-aspect-ratio=1/1\"",
-                        true
-                    )?.upcast()
-            }
-        };
-
-        let pipeline = gst::ElementFactory::make("playbin3")
-            .property("uri", uri.as_str())
-            .property("video-sink", &video_sink_bin)
-            .property("message-forward", true)
-            .property("buffer-duration", 5_000_000_000i64)
-            .property("buffer-size", 3_000_000i32)
-            .build()?
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| Error::Cast)?;
-
-        // Add scaletempo for pitch correction during variable playback speed
-        if let Ok(scaletempo) = gst::ElementFactory::make("scaletempo")
-            .name("pitch-corrector")
-            .build()
-        {
-            pipeline.set_property("audio-filter", &scaletempo);
-            log::info!("Enabled pitch correction for variable playback speed");
-        } else {
-            log::warn!("scaletempo element not available - pitch correction disabled");
-        }
-
-        let video_sink_opt: Option<gst::Element> = pipeline.property("video-sink");
-        let video_sink = match video_sink_opt {
-            Some(e) => e,
-            None => {
-                log::error!("video-sink property is None on pipeline");
-                return Err(Error::Cast);
-            }
-        };
-        let video_sink_bin = video_sink.downcast::<gst::Bin>().map_err(|_| {
-            log::error!("Failed to downcast video-sink to Bin");
-            Error::Cast
-        })?;
-        let video_sink = video_sink_bin.by_name("subwave_appsink").ok_or_else(|| {
-            log::error!("Failed to find 'subwave_appsink' element in video sink bin");
-            Error::Cast
-        })?;
-        let video_sink = video_sink.downcast::<gst_app::AppSink>().map_err(|_| {
-            log::error!("Failed to downcast to AppSink");
-            Error::Cast
-        })?;
-
+        let (pipeline, video_sink) = Self::build_pipeline_with_headers_vec(uri, None)?;
         Self::from_gst_pipeline(pipeline, video_sink)
     }
 
@@ -463,6 +465,9 @@ impl Video for AppsinkVideo {
         (props.width, props.height)
     }
 
+    /// Set HTTP headers for HTTP-based sources via GStreamer "http-headers" context.
+    /// Applies the context to the underlying pipeline so that HTTP elements (e.g. souphttpsrc,
+    /// adaptivedemux segment fetchers) can use them for requests.
     /// Get the framerate of the video as frames per second.
     fn framerate(&self) -> f64 {
         let inner = self.read();
@@ -639,6 +644,25 @@ impl Video for AppsinkVideo {
         let inner = self.read();
         let props = inner.video_props.lock().expect("lock video props");
         props.has_video
+    }
+}
+
+impl AppsinkVideo {
+    /// Create a new video and apply provided HTTP headers before the pipeline starts playing.
+    /// This ensures the initial HTTP request (e.g., playlist or progressive) carries the headers.
+    pub fn new_with_headers(
+        uri: &url::Url,
+        headers: &[(impl AsRef<str>, impl AsRef<str>)],
+    ) -> Result<Self, Error> {
+        gst::init()?;
+        // Normalize headers into owned Vec<String, String> for ergonomic API while sharing builder
+        let owned: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+            .collect();
+        let (pipeline, video_sink) =
+            Self::build_pipeline_with_headers_vec(uri, Some(owned.as_slice()))?;
+        Self::from_gst_pipeline(pipeline, video_sink)
     }
 }
 

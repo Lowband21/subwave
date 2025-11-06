@@ -49,3 +49,10 @@ gstreamer-app = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.g
 log = "0.4"
 thiserror = "^2"
 url = "2"
+
+# [patch."https://github.com/Lowband21/iced-ferrix.git"]
+# iced = { path = "../ferrix-worktrees/main/vendor/iced-ferrix" }
+# iced_core = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/core" }
+# iced_widget = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/widget" }
+# iced_wgpu = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/wgpu" }
+# iced_winit = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/winit" }

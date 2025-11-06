@@ -80,6 +80,19 @@ pub enum SubwaveVideo {
 }
 
 impl SubwaveVideo {
+    #[inline]
+    fn select_backend(cfg: SubwaveConfig) -> BackendPreference {
+        match cfg.preference {
+            BackendPreference::Auto => {
+                if is_wayland() {
+                    BackendPreference::ForceWayland
+                } else {
+                    BackendPreference::ForceAppsink
+                }
+            }
+            other => other,
+        }
+    }
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     fn with_wayland<R>(&self, f: impl FnOnce(&SubsurfaceVideo) -> R) -> Option<R> {
         match self {
@@ -103,23 +116,20 @@ impl SubwaveVideo {
     }
 
     /// Create a new unified video instance from a URL, selecting backend by config.
-    pub fn new_with_config(
+    /// Optionally apply HTTP headers to the underlying pipeline.
+    pub fn new_with_config<T: AsRef<str>, U: AsRef<str>>(
         uri: &url::Url,
         cfg: SubwaveConfig,
+        headers: Option<&[(T, U)]>,
     ) -> Result<Self, subwave_core::Error> {
-        let backend = match cfg.preference {
-            BackendPreference::Auto => {
-                if is_wayland() {
-                    BackendPreference::ForceWayland
-                } else {
-                    BackendPreference::ForceAppsink
-                }
-            }
-            other => other,
-        };
+        let backend = Self::select_backend(cfg);
         match backend {
             BackendPreference::ForceAppsink => {
-                let v = AppsinkVideo::new(uri)?;
+                let v = if let Some(h) = headers {
+                    AppsinkVideo::new_with_headers(uri, h)?
+                } else {
+                    AppsinkVideo::new(uri)?
+                };
                 Ok(SubwaveVideo::Appsink {
                     uri: uri.clone(),
                     cfg,
@@ -128,7 +138,10 @@ impl SubwaveVideo {
             }
             #[cfg(all(feature = "wayland", target_os = "linux"))]
             BackendPreference::ForceWayland => {
-                let v = SubsurfaceVideo::new(uri)?;
+                let mut v = SubsurfaceVideo::new(uri)?;
+                if let Some(h) = headers {
+                    v.set_http_headers(h);
+                }
                 Ok(SubwaveVideo::Wayland {
                     uri: uri.clone(),
                     cfg,
@@ -139,7 +152,11 @@ impl SubwaveVideo {
             #[cfg(not(all(feature = "wayland", target_os = "linux")))]
             BackendPreference::ForceWayland => {
                 warn!("Wayland backend requested on non-Linux platform; falling back to Appsink");
-                let v = AppsinkVideo::new(uri)?;
+                let v = if let Some(h) = headers {
+                    AppsinkVideo::new_with_headers(uri, h)?
+                } else {
+                    AppsinkVideo::new(uri)?
+                };
                 Ok(SubwaveVideo::Appsink {
                     uri: uri.clone(),
                     cfg: SubwaveConfig {
@@ -154,7 +171,24 @@ impl SubwaveVideo {
 
     /// Create a new unified video with default config (Auto selection)
     pub fn new(uri: &url::Url) -> Result<Self, subwave_core::Error> {
-        Self::new_with_config(uri, SubwaveConfig::default())
+        Self::new_with_config::<&str, &str>(uri, SubwaveConfig::default(), None)
+    }
+
+    /// Provide HTTP headers to be used by HTTP-based sources within the pipeline.
+    ///
+    /// This sets a GStreamer "http-headers" context on the underlying pipeline when available.
+    /// For the Wayland backend where the pipeline is lazily created, headers are stored and
+    /// applied once the pipeline is initialized.
+    pub fn set_http_headers(&mut self, headers: &[(impl AsRef<str>, impl AsRef<str>)]) {
+        match self {
+            SubwaveVideo::Appsink { inner, .. } => {
+                inner.set_http_headers(headers);
+            }
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            SubwaveVideo::Wayland { .. } => {
+                self.with_wayland_mut(|video| video.set_http_headers(headers));
+            }
+        }
     }
 
     /// Playback control

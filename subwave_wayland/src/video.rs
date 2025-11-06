@@ -51,6 +51,7 @@ impl Video for SubsurfaceVideo {
             buffering_percent: 100,
             user_paused: false,
             pending_state: None,
+            pending_http_headers: None,
             last_position_update: Instant::now(),
         })))
     }
@@ -338,9 +339,32 @@ impl SubsurfaceVideo {
             buffering_percent: 100,
             user_paused: false,
             pending_state: None,
+            pending_http_headers: None,
             last_position_update: Instant::now(),
         };
         Ok(SubsurfaceVideo(RwLock::new(inner)))
+    }
+
+    /// Set HTTP headers for HTTP-based sources via GStreamer "http-headers" context.
+    /// If the pipeline is not yet initialized, headers are stored and applied during init.
+    pub fn set_http_headers(&mut self, headers: &[(impl AsRef<str>, impl AsRef<str>)]) {
+        // Stash a copy for later application
+        {
+            let mut w = self.0.write();
+            w.pending_http_headers = Some(
+                headers
+                    .iter()
+                    .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+                    .collect(),
+            );
+        }
+
+        // Apply immediately if we already have a pipeline
+        if let Some(p) = self.0.read().pipeline.clone() {
+            if let Some(h) = self.0.read().pending_http_headers.as_ref() {
+                subwave_core::http::set_http_headers_on_pipeline(&p.pipeline, h);
+            }
+        }
     }
 
     // Initialize Wayland and the playback pipeline. Spawns a bus thread that translates
@@ -358,6 +382,11 @@ impl SubsurfaceVideo {
             &integration,
             bounds,
         )?);
+
+        // Apply any pending HTTP headers context before starting message processing
+        if let Some(h) = self.0.read().pending_http_headers.clone() {
+            subwave_core::http::set_http_headers_on_pipeline(&pipeline.pipeline, h.as_slice());
+        }
 
         // Create command channel for bus -> UI updates
         let (tx, rx) = mpsc::channel::<Cmd>();
