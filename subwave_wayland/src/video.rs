@@ -52,6 +52,8 @@ impl Video for SubsurfaceVideo {
             user_paused: false,
             pending_state: None,
             pending_http_headers: None,
+            pending_play_after_seek: false,
+            pending_start_position: None,
             last_position_update: Instant::now(),
         })))
     }
@@ -340,6 +342,8 @@ impl SubsurfaceVideo {
             user_paused: false,
             pending_state: None,
             pending_http_headers: None,
+            pending_play_after_seek: false,
+            pending_start_position: None,
             last_position_update: Instant::now(),
         };
         Ok(SubsurfaceVideo(RwLock::new(inner)))
@@ -669,6 +673,31 @@ impl SubsurfaceVideo {
                                             }
                                         }
                                     }
+                                    // If we are gating autoplay until seek completes, start playback now
+                                    let tx_play = tx.clone();
+                                    let pipeline_clone = gst_pipeline.clone();
+                                    let _ = tx_play.send(Box::new(move |state: &mut Internal| {
+                                        if state.pending_play_after_seek {
+                                            // Optional check: confirm position advanced near target
+                                            if let Some(pos) = pipeline_clone
+                                                .query_position::<gst::ClockTime>()
+                                                .map(|ct| Duration::from_nanos(ct.nseconds()))
+                                            {
+                                                let _target = state.pending_start_position;
+                                                // We trust ACCURATE seek; no strict gating on delta required
+                                                log::debug!("[seek] AsyncDone at {:?}", pos);
+                                            }
+                                            // Only auto-play if user hasn't requested pause
+                                            if !state.user_paused {
+                                                if let Some(p) = state.pipeline.clone() {
+                                                    let _ = p.play();
+                                                }
+                                            } else {
+                                                log::debug!("Autoplay gated by user pause; remaining paused");
+                                            }
+                                            state.pending_play_after_seek = false;
+                                        }
+                                    }));
                                     //// Refresh seekable on AsyncDone as well
                                     //let seekable = {
                                     //    let mut q = gst::query::Seeking::new//(gst::Format::Time);
@@ -759,7 +788,15 @@ impl SubsurfaceVideo {
 
     // Control
     pub fn play(&self) -> Result<(), Error> {
-        let p = self.0.read().pipeline.clone();
+        // Respect explicit user pause intent: do not auto-start if user paused
+        let (user_paused, p) = {
+            let r = self.0.read();
+            (r.user_paused, r.pipeline.clone())
+        };
+        if user_paused {
+            // Silently succeed; caller wanted to play but user has paused explicitly
+            return Ok(());
+        }
         if let Some(p) = p {
             p.play()?;
             Ok(())
@@ -826,10 +863,16 @@ impl SubsurfaceVideo {
         self.set_volume(st.volume);
         self.set_muted(st.muted);
         let _ = self.set_playback_rate(st.speed);
-        if st.paused {
+        // If autoplay-after-seek gating is enabled, do not start playback here; wait for AsyncDone
+        let gate = { self.0.read().pending_play_after_seek };
+        if gate {
             let _ = self.pause();
         } else {
-            let _ = self.play();
+            if st.paused {
+                let _ = self.pause();
+            } else {
+                let _ = self.play();
+            }
         }
         Ok(())
     }
@@ -837,6 +880,13 @@ impl SubsurfaceVideo {
     pub fn queue_pending_state(&self, st: PendingState) {
         let mut w = self.0.write();
         w.pending_state = Some(st);
+    }
+
+    /// Enable autoplay after the next seek completes (AsyncDone), starting exactly at position.
+    pub fn enable_autoplay_after_seek(&mut self, position: Duration) {
+        let mut w = self.0.write();
+        w.pending_play_after_seek = true;
+        w.pending_start_position = Some(position);
     }
 
     pub fn is_playing(&self) -> bool {

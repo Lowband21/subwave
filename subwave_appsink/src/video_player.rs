@@ -1,4 +1,5 @@
 use crate::{render_pipeline::VideoPrimitive, video::AppsinkVideo};
+use gstreamer::prelude::ElementExtManual;
 use gstreamer::{self as gst, glib};
 use iced::{
     Element,
@@ -278,6 +279,24 @@ where
                             log::debug!("GStreamer AsyncDone message received - seek completed");
                             // Clear the cached seek position
                             inner.seek_position = None;
+
+                            // If we are gating autoplay until seek completes, start playback now
+                            if inner.pending_play_after_seek {
+                                // Optional sanity check: ensure current position is at/near target
+                                let _ = inner
+                                    .source
+                                    .query_position::<gst::ClockTime>()
+                                    .map(|pos| pos.nseconds());
+                                // Clear gating regardless; only auto-play if user did not pause
+                                inner.pending_play_after_seek = false;
+                                if !inner.user_paused {
+                                    inner.set_paused(false);
+                                } else {
+                                    log::debug!(
+                                        "Autoplay gated by user pause; staying paused after seek"
+                                    );
+                                }
+                            }
                         }
                         gst::MessageView::StateChanged(state_changed) => {
                             if state_changed

@@ -65,6 +65,10 @@ pub(crate) struct Internal {
     // Pending HTTP headers to apply to pipeline when available
     pub(crate) pending_http_headers: Option<Vec<(String, String)>>,
 
+    // Autoplay gating: when true, wait for seek completion (AsyncDone) before starting playback
+    pub(crate) pending_play_after_seek: bool,
+    pub(crate) pending_start_position: Option<Duration>,
+
     // Throttling
     pub(crate) last_position_update: Instant,
 }

@@ -40,6 +40,13 @@ pub(crate) struct Internal {
     pub(crate) seek_position: Option<Duration>,
     pub(crate) last_valid_position: Duration,
 
+    // Autoplay gating: when true, do not start playback until seek completes
+    pub(crate) pending_play_after_seek: bool,
+    pub(crate) pending_start_position: Option<Duration>,
+
+    // Track explicit user pause intent to avoid overriding with autoplay
+    pub(crate) user_paused: bool,
+
     // Connection monitoring
     pub(crate) current_bitrate: u64, // bits per second
     pub(crate) avg_in_rate: i64,     // average input rate from queue2
@@ -191,6 +198,8 @@ impl Internal {
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) {
+        // Record explicit user intent
+        self.user_paused = paused;
         self.source
             .set_state(if paused {
                 gst::State::Paused

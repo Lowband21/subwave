@@ -39,6 +39,41 @@ impl Default for SubwaveConfig {
     }
 }
 
+/// Options for opening media with the unified API
+#[derive(Debug, Clone)]
+pub struct OpenOptions {
+    pub cfg: SubwaveConfig,
+    pub headers: Option<Vec<(String, String)>>,
+    pub start_seconds: Option<f64>,
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self {
+            cfg: SubwaveConfig::default(),
+            headers: None,
+            start_seconds: None,
+        }
+    }
+    pub fn config(mut self, cfg: SubwaveConfig) -> Self {
+        self.cfg = cfg;
+        self
+    }
+    pub fn headers<T: AsRef<str>, U: AsRef<str>>(mut self, headers: &[(T, U)]) -> Self {
+        self.headers = Some(
+            headers
+                .iter()
+                .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+                .collect(),
+        );
+        self
+    }
+    pub fn start_seconds(mut self, secs: f64) -> Self {
+        self.start_seconds = Some(secs);
+        self
+    }
+}
+
 /// Snapshot of playback state used for backend switching
 #[derive(Debug, Clone)]
 pub struct PlaybackState {
@@ -167,6 +202,91 @@ impl SubwaveVideo {
             }
             BackendPreference::Auto => unreachable!(),
         }
+    }
+
+    /// Open media with additional options such as start position and headers.
+    pub fn open(uri: &url::Url, options: OpenOptions) -> Result<Self, subwave_core::Error> {
+        let backend = Self::select_backend(options.cfg);
+        let start = options.start_seconds.filter(|s| s.is_finite() && *s >= 0.0);
+        match backend {
+            BackendPreference::ForceAppsink => {
+                let video = if let Some(s) = start {
+                    match &options.headers {
+                        Some(h) => AppsinkVideo::new_with_start(uri, s, Some(h.as_slice()))?,
+                        None => AppsinkVideo::new_with_start::<&str, &str>(uri, s, None)?,
+                    }
+                } else {
+                    match &options.headers {
+                        Some(h) => AppsinkVideo::new_with_headers(uri, h.as_slice())?,
+                        None => AppsinkVideo::new(uri)?,
+                    }
+                };
+                Ok(SubwaveVideo::Appsink {
+                    uri: uri.clone(),
+                    cfg: options.cfg,
+                    inner: Box::new(video),
+                })
+            }
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            BackendPreference::ForceWayland => {
+                let mut v = SubsurfaceVideo::new(uri)?;
+                if let Some(h) = options.headers.as_ref() {
+                    v.set_http_headers(h);
+                }
+                if let Some(s) = start {
+                    // Gate autoplay until the accurate seek completes, then start playing.
+                    // Set paused=false in the pending state so that, regardless of the
+                    // order in which the seek-complete (AsyncDone) message and state apply
+                    // are processed, the final state after initialization is PLAYING.
+                    v.enable_autoplay_after_seek(Duration::from_secs_f64(s));
+                    v.queue_pending_state(PendingState {
+                        paused: false,
+                        position: Duration::from_secs_f64(s),
+                        speed: 1.0,
+                        volume: 1.0,
+                        muted: false,
+                        audio_track: -1,
+                        subtitle_track: None,
+                        subtitles_enabled: false,
+                        subtitle_url: None,
+                    });
+                }
+                Ok(SubwaveVideo::Wayland {
+                    uri: uri.clone(),
+                    cfg: options.cfg,
+                    handle: Rc::new(RefCell::new(Some(Box::new(v)))),
+                    pending: Arc::new(Mutex::new(None)),
+                })
+            }
+            #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+            BackendPreference::ForceWayland => {
+                warn!("Wayland backend requested on non-Linux platform; falling back to Appsink");
+                let video = if let Some(s) = start {
+                    match &options.headers {
+                        Some(h) => AppsinkVideo::new_with_start(uri, s, Some(h.as_slice()))?,
+                        None => AppsinkVideo::new_with_start::<&str, &str>(uri, s, None)?,
+                    }
+                } else {
+                    match &options.headers {
+                        Some(h) => AppsinkVideo::new_with_headers(uri, h.as_slice())?,
+                        None => AppsinkVideo::new(uri)?,
+                    }
+                };
+                Ok(SubwaveVideo::Appsink {
+                    uri: uri.clone(),
+                    cfg: SubwaveConfig {
+                        preference: BackendPreference::ForceAppsink,
+                    },
+                    inner: Box::new(video),
+                })
+            }
+            BackendPreference::Auto => unreachable!(),
+        }
+    }
+
+    /// Convenience to open and start at a given time (seconds).
+    pub fn open_at_seconds(uri: &url::Url, seconds: f64) -> Result<Self, subwave_core::Error> {
+        Self::open(uri, OpenOptions::new().start_seconds(seconds))
     }
 
     /// Create a new unified video with default config (Auto selection)

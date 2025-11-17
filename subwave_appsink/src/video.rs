@@ -164,6 +164,16 @@ impl AppsinkVideo {
         pipeline: gst::Pipeline,
         video_sink: gst_app::AppSink,
     ) -> Result<Self, Error> {
+        Self::from_gst_pipeline_with_state(pipeline, video_sink, gst::State::Playing)
+    }
+
+    /// Creates a new video from an existing pipeline/appsink and sets an initial state.
+    /// When starting at a specific position, prefer initializing in PAUSED and seeking first.
+    pub fn from_gst_pipeline_with_state(
+        pipeline: gst::Pipeline,
+        video_sink: gst_app::AppSink,
+        initial_state: gst::State,
+    ) -> Result<Self, Error> {
         gst::init()?;
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
@@ -181,13 +191,13 @@ impl AppsinkVideo {
 
         let pad = video_sink.pads().first().cloned().unwrap();
 
-        log::debug!("Setting pipeline to PLAYING state");
-        match pipeline.set_state(gst::State::Playing) {
+        log::debug!("Setting pipeline to {:?} state", initial_state);
+        match pipeline.set_state(initial_state) {
             Ok(state_change) => {
                 log::debug!("State change result: {:?}", state_change);
             }
             Err(e) => {
-                log::error!("Failed to set pipeline to PLAYING: {:?}", e);
+                log::error!("Failed to set pipeline state {:?}: {:?}", initial_state, e);
 
                 // Get more details about the error
                 if let Some(bus) = pipeline.bus() {
@@ -201,7 +211,7 @@ impl AppsinkVideo {
         }
 
         // wait for up to 5 seconds until the decoder gets the source capabilities
-        log::debug!("Waiting for pipeline to reach PLAYING state");
+        log::debug!("Waiting for pipeline to reach {:?} state", initial_state);
         let state_result = pipeline.state(gst::ClockTime::from_seconds(5));
         match state_result {
             (Ok(state_change), current, pending) => {
@@ -402,6 +412,10 @@ impl AppsinkVideo {
 
             seek_position: None,
             last_valid_position: Duration::ZERO,
+
+            pending_play_after_seek: false,
+            pending_start_position: None,
+            user_paused: false,
 
             current_bitrate: 0,
             avg_in_rate: 0,
@@ -663,6 +677,45 @@ impl AppsinkVideo {
         let (pipeline, video_sink) =
             Self::build_pipeline_with_headers_vec(uri, Some(owned.as_slice()))?;
         Self::from_gst_pipeline(pipeline, video_sink)
+    }
+
+    /// Create a new video that starts playback at a specific position.
+    ///
+    /// This initializes the pipeline in PAUSED, performs an accurate, flushing seek to the
+    /// requested position, and defers PLAYING until the seek completes (AsyncDone).
+    pub fn new_with_start<T: AsRef<str>, U: AsRef<str>>(
+        uri: &url::Url,
+        start_seconds: f64,
+        headers: Option<&[(T, U)]>,
+    ) -> Result<Self, Error> {
+        gst::init()?;
+        let start_seconds = if start_seconds.is_finite() && start_seconds >= 0.0 {
+            start_seconds
+        } else {
+            0.0
+        };
+        let owned_headers: Option<Vec<(String, String)>> = headers.map(|h| {
+            h.iter()
+                .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+                .collect()
+        });
+        let (pipeline, video_sink) =
+            Self::build_pipeline_with_headers_vec(uri, owned_headers.as_deref())?;
+
+        // Start PAUSED to avoid any playback before we seek
+        let mut video =
+            Self::from_gst_pipeline_with_state(pipeline, video_sink, gst::State::Paused)?;
+
+        // Configure autoplay gating: only start after the seek completes
+        {
+            let mut inner = video.get_mut();
+            inner.pending_play_after_seek = true;
+            inner.pending_start_position = Some(Duration::from_secs_f64(start_seconds));
+            // Perform an accurate flushing seek to the target time
+            inner.seek(Duration::from_secs_f64(start_seconds), true)?;
+        }
+
+        Ok(video)
     }
 }
 

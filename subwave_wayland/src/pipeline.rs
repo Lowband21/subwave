@@ -219,119 +219,33 @@ impl SubsurfacePipeline {
         let current_state = self.pipeline.current_state();
         log::debug!("play() called, current state: {:?}", current_state);
 
-        // First, ensure we're in PAUSED state (this triggers dynamic pad creation)
+        // Non-blocking: request PAUSED to trigger preroll if needed, do not wait
         if current_state != gst::State::Paused && current_state != gst::State::Playing {
-            log::debug!("Setting pipeline to PAUSED for preroll...");
-
-            match self.pipeline.set_state(gst::State::Paused) {
-                Ok(gst::StateChangeSuccess::Success) => {
-                    log::debug!("Synchronous state change to PAUSED");
-                }
-                Ok(gst::StateChangeSuccess::Async) => {
-                    log::debug!("Async state change to PAUSED, waiting for completion...");
-
-                    // Wait for preroll with a timeout
-                    let (result, state, pending) =
-                        self.pipeline.state(gst::ClockTime::from_seconds(10));
-                    log::debug!(
-                        "After wait: result={:?}, state={:?}, pending={:?}",
-                        result,
-                        state,
-                        pending
-                    );
-
-                    if state != gst::State::Paused {
-                        // Check for errors on the bus
-                        if let Some(bus) = self.pipeline.bus() {
-                            while let Some(msg) = bus.pop() {
-                                use gst::MessageView;
-                                if let MessageView::Error(err) = msg.view() {
-                                    log::debug!("Error during preroll: {:?}", err);
-                                    return Err(Error::Pipeline(format!(
-                                        "Preroll error: {:?}",
-                                        err
-                                    )));
-                                }
-                            }
-                        }
-
-                        // If still not in PAUSED after timeout, warn but continue
-                        log::debug!(
-                            "Warning: Failed to reach PAUSED state, attempting to play anyway"
-                        );
-                    } else {
-                        log::debug!("Successfully prerolled to PAUSED");
-                    }
-                }
-                Ok(gst::StateChangeSuccess::NoPreroll) => {
-                    log::debug!("No preroll needed (live source)");
-                }
-                Err(e) => {
-                    log::debug!("Failed to set PAUSED state: {:?}", e);
-                    return Err(Error::Pipeline(format!("Failed to pause: {:?}", e)));
-                }
+            if let Err(e) = self.pipeline.set_state(gst::State::Paused) {
+                log::debug!("Failed to request PAUSED state: {:?}", e);
+                return Err(Error::Pipeline(format!("Failed to pause: {:?}", e)));
             }
         }
 
-        // Now transition to PLAYING
-        log::debug!("Setting pipeline to PLAYING...");
+        // Immediately request PLAYING; bus thread will observe readiness/AsyncDone
+        log::debug!("Requesting PLAYING state (non-blocking)...");
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| Error::Pipeline(format!("Failed to play: {:?}", e)))?;
 
-        log::debug!("Successfully set to Playing state");
         Ok(())
     }
 
     /// Pause playback
     pub fn pause(&self) -> Result<()> {
         let current_state = self.pipeline.current_state();
-        log::debug!(
-            "Attempting to pause pipeline from state: {:?}",
-            current_state
-        );
+        log::debug!("pause() called from state: {:?}", current_state);
 
-        // If in Null state, first go to Ready
-        if current_state == gst::State::Null {
-            log::debug!("Pipeline in Null state, transitioning to Ready first...");
-            self.pipeline
-                .set_state(gst::State::Ready)
-                .map_err(|e| Error::Pipeline(format!("Failed to set Ready state: {:?}", e)))?;
-        }
-
-        let result = self.pipeline.set_state(gst::State::Paused);
-        log::debug!("set_state(Paused) returned: {:?}", result);
-
-        match result {
-            Ok(state_change) => {
-                log::debug!("State change success: {:?}", state_change);
-
-                // Wait a bit for state change to complete
-                let (res, state, pending) = self.pipeline.state(gst::ClockTime::from_seconds(1));
-                log::debug!(
-                    "After pause - Result: {:?}, State: {:?}, Pending: {:?}",
-                    res,
-                    state,
-                    pending
-                );
-
-                Ok(())
-            }
-            Err(e) => {
-                log::debug!("Failed to pause: {:?}", e);
-
-                // Try to get more debug info
-                let (res, state, pending) = self.pipeline.state(gst::ClockTime::from_seconds(0));
-                log::debug!(
-                    "Current state - Result: {:?}, State: {:?}, Pending: {:?}",
-                    res,
-                    state,
-                    pending
-                );
-
-                Err(Error::Pipeline(format!("Failed to pause: {:?}", e)))
-            }
-        }
+        // Non-blocking: request PAUSED and return
+        self.pipeline
+            .set_state(gst::State::Paused)
+            .map_err(|e| Error::Pipeline(format!("Failed to pause: {:?}", e)))?;
+        Ok(())
     }
 
     /// Stop playback
@@ -344,10 +258,15 @@ impl SubsurfacePipeline {
     }
 
     /// Seek to a specific position
-    pub fn seek(&self, position: impl Into<Position>, _accurate: bool) -> Result<()> {
+    pub fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<()> {
         let position = position.into();
 
-        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT; //| gst::SeekFlags::TRICKMODE; // | gst::SeekFlags::ACCURATE; // No point accurate seeking for video playback
+        let mut flags = gst::SeekFlags::FLUSH;
+        if accurate {
+            flags |= gst::SeekFlags::ACCURATE;
+        } else {
+            flags |= gst::SeekFlags::KEY_UNIT;
+        }
 
         // Perform the seek
         match &position {
