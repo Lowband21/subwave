@@ -47,6 +47,12 @@ pub struct OpenOptions {
     pub start_seconds: Option<f64>,
 }
 
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenOptions {
     pub fn new() -> Self {
         Self {

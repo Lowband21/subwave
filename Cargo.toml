@@ -29,15 +29,15 @@ categories = ["multimedia"]
 
 [workspace.dependencies]
 # Iced dependencies
-iced = { git = "https://github.com/Lowband21/iced-ferrix.git", default-features = false, features = [
+iced = { git = "https://github.com/Lowband21/iced-ferrex.git", default-features = false, features = [
   "advanced",
   "wgpu",
   "image",
   "thread-pool",
   "wayland-hack",
 ] }
-iced_wgpu = { git = "https://github.com/Lowband21/iced-ferrix.git" }
-iced_winit = { git = "https://github.com/Lowband21/iced-ferrix.git" }
+iced_wgpu = { git = "https://github.com/Lowband21/iced-ferrex.git" }
+iced_winit = { git = "https://github.com/Lowband21/iced-ferrex.git" }
 
 # GStreamer dependencies
 gstreamer = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.git", branch = "main" }
@@ -50,9 +50,9 @@ log = "0.4"
 thiserror = "^2"
 url = "2"
 
-# [patch."https://github.com/Lowband21/iced-ferrix.git"]
-# iced = { path = "../ferrix-worktrees/main/vendor/iced-ferrix" }
-# iced_core = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/core" }
-# iced_widget = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/widget" }
-# iced_wgpu = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/wgpu" }
-# iced_winit = { path = "../ferrix-worktrees/main/vendor/iced_ferrix/winit" }
+# [patch."https://github.com/Lowband21/iced-ferrex.git"]
+# iced = { path = "../ferrex-worktrees/main/vendor/iced-ferrex" }
+# iced_core = { path = "../ferrex-worktrees/main/vendor/iced_ferrex/core" }
+# iced_widget = { path = "../ferrex-worktrees/main/vendor/iced_ferrex/widget" }
+# iced_wgpu = { path = "../ferrex-worktrees/main/vendor/iced_ferrex/wgpu" }
+# iced_winit = { path = "../ferrex-worktrees/main/vendor/iced_ferrex/winit" }

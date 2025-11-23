@@ -37,7 +37,7 @@ This crate implements video playback using Wayland subsurfaces, which allows:
    - Dynamic pipeline creation
    - Direct rendering to Wayland surface via VideoOverlay interface
 
-4. **WaylandIntegration** (in iced_ferrix)
+4. **WaylandIntegration** (in iced_ferrex)
    - Thread-local storage for Wayland handles
    - Pre-commit hooks for atomic updates
    - Set/cleared during iced's draw cycle
@@ -67,7 +67,7 @@ pub fn surface_handle(&self) -> usize {
 
 ## Required Iced Fork Modifications
 
-The iced fork at `git@github.com:Lowband21/iced-ferrix.git` has been modified to expose Wayland handles:
+The iced fork at `git@github.com:Lowband21/iced-ferrex.git` has been modified to expose Wayland handles:
 
 ### iced_winit Changes
 - Added thread-local storage for WaylandIntegration
