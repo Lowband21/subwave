@@ -11,9 +11,9 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Lowband21/Subwave"
+repository = "https://github.com/Lowband21/subwave"
 documentation = "https://docs.rs/subwave"
-homepage = "https://github.com/Lowband21/Subwave"
+homepage = "https://github.com/Lowband21/subwave"
 readme = "README.md"
 keywords = [
   "streaming",
@@ -35,6 +35,7 @@ iced = { git = "https://github.com/Lowband21/iced-ferrex.git", default-features 
   "image",
   "thread-pool",
   "wayland-hack",
+  "wayland",
 ] }
 iced_wgpu = { git = "https://github.com/Lowband21/iced-ferrex.git" }
 iced_winit = { git = "https://github.com/Lowband21/iced-ferrex.git" }

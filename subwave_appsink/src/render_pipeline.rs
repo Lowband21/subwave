@@ -1,5 +1,5 @@
 use iced::wgpu::TextureFormat;
-use iced_wgpu::primitive::Primitive;
+use iced_wgpu::primitive::{Pipeline, Primitive};
 use iced_wgpu::wgpu;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -44,6 +44,16 @@ pub(crate) struct VideoRenderPipeline {
     bg0_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     videos: BTreeMap<u64, VideoEntry>,
+}
+
+impl Pipeline for VideoRenderPipeline {
+    fn new(
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self::new(device, format)
+    }
 }
 
 impl VideoRenderPipeline {
@@ -499,28 +509,11 @@ impl VideoPrimitive {
 }
 
 impl Primitive for VideoPrimitive {
-    type Renderer = VideoRenderPipeline;
-
-    fn initialize(
-        &self,
-        device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-    ) -> Self::Renderer {
-        log::warn!(
-            "VideoPrimitive::initialize creating new pipeline with format: {:?}",
-            format
-        );
-        eprintln!("=== CREATING VIDEO PIPELINE ===");
-        eprintln!("Surface format: {:?}", format);
-        eprintln!("===============================");
-
-        VideoRenderPipeline::new(device, format)
-    }
+    type Pipeline = VideoRenderPipeline;
 
     fn prepare(
         &self,
-        renderer: &mut Self::Renderer,
+        renderer: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         bounds: &iced::Rectangle,
@@ -556,7 +549,7 @@ impl Primitive for VideoPrimitive {
 
     fn render(
         &self,
-        renderer: &Self::Renderer,
+        renderer: &Self::Pipeline,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &iced::Rectangle<u32>,

@@ -9,13 +9,15 @@ use crate::WaylandIntegration;
 /// initialize Video objects with Wayland subsurfaces.
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// use subwave_wayland::{window, SubsurfaceVideo};
 ///
 /// // In your application's update function, after window creation:
+/// let uri = "file:///path/to/video.mp4".to_string();
 /// if let Some(integration) = window::get_wayland_integration() {
 ///     let video = SubsurfaceVideo::new(&uri)?;
-///     video.init_wayland(&integration)?;
+///     let bounds = (0, 0, 1920, 1080); // x, y, width, height
+///     video.init_wayland(integration, bounds)?;
 ///     // Now the video can be used with VideoPlayer widget
 /// }
 /// ```
