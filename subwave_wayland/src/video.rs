@@ -20,6 +20,20 @@ pub struct SubsurfaceVideo(pub(crate) RwLock<Internal>);
 // Bus commands are closures applied on Internal on the UI thread
 pub type Cmd = Box<dyn FnOnce(&mut Internal) + Send + 'static>;
 
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "" | "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => true,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 // Implement the core Video trait for Wayland-backed SubsurfaceVideo
 impl Video for SubsurfaceVideo {
     type Video = SubsurfaceVideo;
@@ -50,6 +64,7 @@ impl Video for SubsurfaceVideo {
             is_buffering: false,
             buffering_percent: 100,
             user_paused: false,
+            startup_async_done: false,
             pending_state: None,
             pending_http_headers: None,
             pending_play_after_seek: false,
@@ -340,6 +355,7 @@ impl SubsurfaceVideo {
             is_buffering: false,
             buffering_percent: 100,
             user_paused: false,
+            startup_async_done: false,
             pending_state: None,
             pending_http_headers: None,
             pending_play_after_seek: false,
@@ -403,22 +419,9 @@ impl SubsurfaceVideo {
                 .name(format!("gst-bus-{}", self.0.read().uri))
                 .spawn(move || {
                     use gst::MessageView;
-                    // Track desired selection and readiness
-                    let mut desired_select_ids: Option<Vec<String>> = None;
-                    let mut did_send_select = false;
-                    let mut pipeline_ready = false;
 
-                    // Helper to send SelectStreams preferring pipeline
-                    fn send_select_streams_preferring_pipeline(
-                        pipe: &gst::Pipeline,
-                        ids: &[String],
-                    ) -> bool {
-                        let evt = gst::event::SelectStreams::new(ids.iter().map(|s| s.as_str()));
-                        if pipe.send_event(evt) {
-                            return true;
-                        }
-                        false
-                    }
+                    let disable_text = env_flag_enabled("SUBWAVE_DISABLE_TEXT");
+                    let mut forced_text_off = false;
 
                     while !stop.load(Ordering::SeqCst) {
                         if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) {
@@ -571,21 +574,72 @@ impl SubsurfaceVideo {
                                         }
                                     }
 
-                                    // Compute initial selection
-                                    let mut initial_ids: Vec<String> = Vec::new();
-                                    if let Some(v) = first_video_id.clone() { initial_ids.push(v); }
-                                    if let Some(aid) = audio_ids.first() { initial_ids.push(aid.clone()); }
-                                    let chosen_text = best_text_id.or(any_text_id);
-                                    if let Some(tid) = chosen_text.clone() { initial_ids.push(tid); }
+                                    // Track current playbin selection without forcing an immediate
+                                    // startup SelectStreams event (which can cause reconfigure churn).
+                                    let mut current_audio_prop = if gst_pipeline.has_property("current-audio") {
+                                        gst_pipeline.property::<i32>("current-audio")
+                                    } else {
+                                        -1
+                                    };
+                                    let mut current_text_prop = if disable_text {
+                                        -1
+                                    } else if gst_pipeline.has_property("current-text") {
+                                        gst_pipeline.property::<i32>("current-text")
+                                    } else {
+                                        -1
+                                    };
 
-                                    let subtitles_enabled = chosen_text.is_some();
-                                    let current_audio_index = if audio_ids.is_empty() { -1 } else { 0 };
-                                    let current_sub_index = if subtitles_enabled { Some(0) } else { None };
+                                    // Stabilize startup defaults without sending SelectStreams.
+                                    if current_audio_prop < 0 && !audio_ids.is_empty() && gst_pipeline.has_property("current-audio") {
+                                        gst_pipeline.set_property("current-audio", 0i32);
+                                        current_audio_prop = 0;
+                                    }
+                                    if disable_text && current_text_prop >= 0 && gst_pipeline.has_property("current-text") {
+                                        gst_pipeline.set_property("current-text", -1i32);
+                                        current_text_prop = -1;
+                                    }
+
+                                    let mut selected_ids: Vec<String> = Vec::new();
+                                    if let Some(v) = first_video_id.clone() {
+                                        selected_ids.push(v);
+                                    }
+
+                                    let mut current_audio_index = -1;
+                                    if current_audio_prop >= 0
+                                        && (current_audio_prop as usize) < audio_ids.len()
+                                    {
+                                        current_audio_index = current_audio_prop;
+                                        selected_ids.push(audio_ids[current_audio_prop as usize].clone());
+                                    } else if let Some(aid) = audio_ids.first() {
+                                        current_audio_index = 0;
+                                        selected_ids.push(aid.clone());
+                                    }
+
+                                    let mut subtitles_enabled = false;
+                                    let mut current_sub_index: Option<i32> = None;
+                                    if current_text_prop >= 0
+                                        && (current_text_prop as usize) < subtitle_ids.len()
+                                    {
+                                        subtitles_enabled = true;
+                                        current_sub_index = Some(current_text_prop);
+                                        selected_ids.push(subtitle_ids[current_text_prop as usize].clone());
+                                    } else if !disable_text {
+                                        // Keep legacy hint for UI when current-text is not exposed yet.
+                                        let chosen_text = best_text_id.or(any_text_id);
+                                        if env_flag_enabled("SUBWAVE_AUTO_ENABLE_SUBS") {
+                                            if let Some(tid) = chosen_text {
+                                                subtitles_enabled = true;
+                                                current_sub_index = Some(0);
+                                                selected_ids.push(tid);
+                                            }
+                                        }
+                                    }
+
+                                    dedup_in_place(&mut selected_ids);
 
                                     // Update internal state immediately to expose available tracks
                                     let coll_clone = collection.clone();
                                     let tx_tracks = tx.clone();
-                                    let ids_for_state = initial_ids.clone();
                                     if tx_tracks
                                         .send(Box::new(move |s: &mut Internal| {
                                             s.stream_collection = Some(coll_clone);
@@ -593,7 +647,7 @@ impl SubsurfaceVideo {
                                             s.available_subtitles = subtitle_tracks;
                                             s.audio_index_to_stream_id = audio_ids;
                                             s.subtitle_index_to_stream_id = subtitle_ids;
-                                            s.selected_stream_ids = ids_for_state;
+                                            s.selected_stream_ids = selected_ids;
                                             s.current_audio_track = current_audio_index;
                                             s.current_subtitle_track = current_sub_index;
                                             s.subtitles_enabled = subtitles_enabled;
@@ -602,19 +656,6 @@ impl SubsurfaceVideo {
                                     {
                                         log::debug!("[bus] receiver dropped; exiting bus thread");
                                         break;
-                                    }
-
-                                    // Stage selection; send when ready
-                                    desired_select_ids = Some(initial_ids);
-                                    if pipeline_ready && !did_send_select {
-                                        if let Some(ref ids) = desired_select_ids {
-                                            if send_select_streams_preferring_pipeline(&gst_pipeline, ids) {
-                                                log::info!("[streams] Sent SelectStreams after collection");
-                                                did_send_select = true;
-                                            } else {
-                                                log::warn!("[streams] Failed to send SelectStreams on collection; will retry later");
-                                            }
-                                        }
                                     }
                                 }
                                 MessageView::StreamsSelected(sel) => {
@@ -633,50 +674,26 @@ impl SubsurfaceVideo {
                                     if let Some(src) = msg.src() {
                                         if src.name() == gst_pipeline.name() {
                                             let cur = state_changed.current();
-                                            if cur == gst::State::Paused || cur == gst::State::Playing {
-                                                pipeline_ready = true;
-                                                if !did_send_select {
-                                                    if let Some(ref ids) = desired_select_ids {
-                                                        if send_select_streams_preferring_pipeline(&gst_pipeline, ids) {
-                                                            log::info!("[streams] Sent SelectStreams on state ready");
-                                                            did_send_select = true;
-                                                        } else {
-                                                            log::warn!("[streams] SelectStreams send failed on state change; will retry");
-                                                        }
-                                                    }
+                                            if disable_text
+                                                && !forced_text_off
+                                                && (cur == gst::State::Paused
+                                                    || cur == gst::State::Playing)
+                                            {
+                                                if gst_pipeline.has_property("current-text") {
+                                                    gst_pipeline.set_property("current-text", -1i32);
                                                 }
+                                                forced_text_off = true;
                                             }
-                                            /*
-                                            // Update seekable
-                                            let seekable = {
-                                                let mut q = gst::query::Seeking::new(gst::Format::Time);
-                                                if gst_pipeline.query(q.query_mut()) {
-                                                    let (seekable, _, _) = q.result();
-                                                    Some(seekable)
-                                                } else { None }
-                                            };
-                                            if let Some(seek) = seekable {
-                                                if tx.send(Box::new(move |s: &mut Internal| s.video_props.seekable = seek)).is_err() {
-                                                    log::debug!("[bus] receiver dropped; exiting bus thread");
-                                                    break;
-                                                }
-                                            }*/
                                         }
                                     }
                                 }
                                 MessageView::AsyncDone(_) => {
-                                    if pipeline_ready && !did_send_select {
-                                        if let Some(ref ids) = desired_select_ids {
-                                            if send_select_streams_preferring_pipeline(&gst_pipeline, ids) {
-                                                log::info!("[streams] Sent SelectStreams after AsyncDone");
-                                                did_send_select = true;
-                                            }
-                                        }
-                                    }
                                     // If we are gating autoplay until seek completes, start playback now
                                     let tx_play = tx.clone();
                                     let pipeline_clone = gst_pipeline.clone();
                                     let _ = tx_play.send(Box::new(move |state: &mut Internal| {
+                                        state.startup_async_done = true;
+
                                         if state.pending_play_after_seek {
                                             // Optional check: confirm position advanced near target
                                             if let Some(pos) = pipeline_clone
@@ -769,15 +786,20 @@ impl SubsurfaceVideo {
 
         // 2) Apply pending state when pipeline is ready
         if let Some(st) = pending {
-            let has_pipeline = self.0.read().pipeline.is_some();
-            if has_pipeline {
-                // Best-effort apply; if not ready, requeue
+            let ready_for_apply = {
+                let r = self.0.read();
+                r.pipeline.is_some() && r.startup_async_done
+            };
+
+            if ready_for_apply {
+                // Best-effort apply; if still not ready for a specific operation, requeue.
                 let requeue = self.apply_state_now(&st).is_err();
                 if requeue {
                     let mut w = self.0.write();
                     w.pending_state = Some(st);
                 }
             } else {
+                // Wait for initial AsyncDone before first resume-state application.
                 let mut w = self.0.write();
                 w.pending_state = Some(st);
             }
@@ -851,9 +873,22 @@ impl SubsurfaceVideo {
     fn apply_state_now(&mut self, st: &PendingState) -> Result<(), ()> {
         // Pause first, ignore errors
         let _ = self.pause();
-        let _ = self.select_audio_track(st.audio_track);
-        let _ = self.select_subtitle_track(st.subtitle_track);
-        self.set_subtitles_enabled(st.subtitles_enabled);
+
+        // Only apply explicit track selections when present to avoid startup churn.
+        if st.audio_track >= 0 {
+            let _ = self.select_audio_track(st.audio_track);
+        }
+
+        if st.subtitles_enabled {
+            if st.subtitle_track.is_some() {
+                let _ = self.select_subtitle_track(st.subtitle_track);
+            } else {
+                let _ = self.set_subtitles_enabled(true);
+            }
+        } else if self.subtitles_enabled() {
+            let _ = self.select_subtitle_track(None);
+        }
+
         if let Some(url) = &st.subtitle_url {
             let _ = self.set_subtitle_url(url);
         }
@@ -1013,7 +1048,7 @@ impl SubsurfaceVideo {
 
     pub fn select_audio_track(&self, index: i32) -> Result<(), Error> {
         // Gather required info without holding the lock during GStreamer calls
-        let (p, mut new_ids, audio_ids) = {
+        let (p, mut new_ids, old_ids, audio_ids) = {
             let r = self.0.read();
             let p = r.pipeline.clone();
             if index < 0 || (index as usize) >= r.audio_index_to_stream_id.len() {
@@ -1023,11 +1058,12 @@ impl SubsurfaceVideo {
                 )));
             }
             let mut ids = r.selected_stream_ids.clone();
+            let old_ids = ids.clone();
             // Remove any existing audio IDs
             if !r.audio_index_to_stream_id.is_empty() {
                 ids.retain(|id| !r.audio_index_to_stream_id.iter().any(|aid| aid == id));
             }
-            (p, ids, r.audio_index_to_stream_id.clone())
+            (p, ids, old_ids, r.audio_index_to_stream_id.clone())
         };
 
         let Some(p) = p else {
@@ -1038,6 +1074,13 @@ impl SubsurfaceVideo {
         new_ids.push(target_id);
         // Dedup while preserving order
         dedup_in_place(&mut new_ids);
+
+        // No-op: desired selection already active.
+        if new_ids == old_ids {
+            let mut w = self.0.write();
+            w.current_audio_track = index;
+            return Ok(());
+        }
 
         let ok = p.send_select_streams(&new_ids);
         if ok {
@@ -1053,15 +1096,16 @@ impl SubsurfaceVideo {
     }
 
     pub fn select_subtitle_track(&self, index: Option<i32>) -> Result<(), Error> {
-        let (p, mut new_ids, sub_ids) = {
+        let (p, mut new_ids, old_ids, sub_ids) = {
             let r = self.0.read();
             let p = r.pipeline.clone();
             let mut ids = r.selected_stream_ids.clone();
+            let old_ids = ids.clone();
             // Remove existing subtitle ids
             if !r.subtitle_index_to_stream_id.is_empty() {
                 ids.retain(|id| !r.subtitle_index_to_stream_id.iter().any(|sid| sid == id));
             }
-            (p, ids, r.subtitle_index_to_stream_id.clone())
+            (p, ids, old_ids, r.subtitle_index_to_stream_id.clone())
         };
 
         let Some(p) = p else {
@@ -1083,6 +1127,14 @@ impl SubsurfaceVideo {
             enabled = true;
         }
         dedup_in_place(&mut new_ids);
+
+        // No-op: desired selection already active.
+        if new_ids == old_ids {
+            let mut w = self.0.write();
+            w.current_subtitle_track = new_current;
+            w.subtitles_enabled = enabled;
+            return Ok(());
+        }
 
         let ok = p.send_select_streams(&new_ids);
         if ok {

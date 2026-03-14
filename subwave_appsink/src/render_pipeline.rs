@@ -47,11 +47,7 @@ pub(crate) struct VideoRenderPipeline {
 }
 
 impl Pipeline for VideoRenderPipeline {
-    fn new(
-        device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-    ) -> Self {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         Self::new(device, format)
     }
 }

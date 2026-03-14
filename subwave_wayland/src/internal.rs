@@ -35,6 +35,9 @@ pub(crate) struct Internal {
     pub(crate) buffering_percent: i32,
     pub(crate) user_paused: bool,
 
+    // Startup readiness: first AsyncDone observed from pipeline
+    pub(crate) startup_async_done: bool,
+
     // Bus thread control
     pub(crate) bus_thread: Option<JoinHandle<()>>,
     pub(crate) bus_stop: Arc<AtomicBool>,

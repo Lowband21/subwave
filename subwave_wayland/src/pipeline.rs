@@ -11,6 +11,50 @@ use crate::gstplayflags::gst_play_flags::GstPlayFlags;
 use crate::{Error, Result, WaylandIntegration, WaylandSubsurfaceManager};
 use subwave_core::video::types::Position;
 
+/// Build a `GstWaylandDisplayHandleContextType` context carrying `display`.
+///
+/// `display_addr` is the raw `wl_display*` pointer cast to `usize`.
+fn wayland_display_context(display_addr: usize) -> gst::Context {
+    const CTX_TYPE: &str = "GstWaylandDisplayHandleContextType";
+
+    let mut context = gst::Context::new(CTX_TYPE, true);
+    {
+        let context = context.get_mut().unwrap();
+        let structure = context.structure_mut();
+        unsafe {
+            use glib::translate::{ToGlibPtr, ToGlibPtrMut};
+            use gstreamer::ffi as gst_ffi;
+
+            let mut value = glib::Value::from_type(glib::Type::POINTER);
+            glib::gobject_ffi::g_value_set_pointer(
+                value.to_glib_none_mut().0,
+                display_addr as *mut std::ffi::c_void,
+            );
+
+            gst_ffi::gst_structure_set_value(
+                structure.as_ptr() as *mut gst_ffi::GstStructure,
+                c"display".as_ptr(),
+                value.to_glib_none().0,
+            );
+        }
+    }
+    context
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "" | "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => true,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 pub struct SubsurfacePipeline {
     speed: f64,
     pub pipeline: Arc<gst::Pipeline>,
@@ -37,14 +81,8 @@ impl SubsurfacePipeline {
             .name("playbin3")
             .property("message-forward", true)
             .property("async-handling", true)
-            //.property("connection-speed", 500000u64)
-            // CRITICAL NOTE: Must be larger than video-sink-bin's queue2 buffer
-            //.property("buffer-duration", 10_000_000_000i64) // 5s
-            //.property("buffer-size", 3_000_000i32)
-            .property("buffer-duration", 6_000_000_000i64) // 5s
-            //.property("buffer-size", 6_000_000i32)
+            .property("buffer-duration", 6_000_000_000i64)
             .property("ring-buffer-max-size", 536870912u64)
-            //.property("delay", 500_000_000u64)
             .build()
             .map_err(|_| Error::Pipeline("Failed to create playbin3 element".to_string()))?
             .downcast::<gst::Pipeline>()
@@ -54,140 +92,77 @@ impl SubsurfacePipeline {
 
         pipeline.set_property("uri", uri.as_str());
 
-        pipeline.set_property("flags", GstPlayFlags::wayland_native());
+        let play_flags = GstPlayFlags::wayland_native();
+        let disable_text = env_flag_enabled("SUBWAVE_DISABLE_TEXT");
+        log::info!(
+            "[pipeline] playbin flags={} (SUBWAVE_DISABLE_TEXT={})",
+            play_flags,
+            disable_text
+        );
+        pipeline.set_property("flags", play_flags);
 
+        // Belt-and-suspenders for debug mode: explicitly disable current text selection.
+        if disable_text && pipeline.has_property("current-text") {
+            pipeline.set_property("current-text", -1i32);
+        }
+
+        // ── Build waylandsink ──────────────────────────────────────────
+        // Do NOT set display context or window handle here.
+        // GStreamer 1.28's waylandsink starts a background Wayland
+        // event-dispatch thread inside gst_wl_display_new_existing()
+        // the moment set_context() is called. Doing this while iced's
+        // event loop is running (we are inside draw()) races with the
+        // main Wayland event loop and segfaults.
+        //
+        // Instead we install a bus *sync handler* (below) that provides
+        // the display context and window handle exactly when waylandsink
+        // asks for them during the state transition.  This matches the
+        // official GStreamer waylandsink integration example.
         let video_sink = gst::ElementFactory::make("waylandsink")
             .name("vsink")
             .property("async", true)
             .property("sync", true)
-            // Setting too high causes stuttering, will have adjust dynamically to optimize
-            //.property("blocksize", 500_000u32)
             .build()
             .map_err(|err| {
-                println!("Failed to build video sink: {}", err);
-                Error::Pipeline("Failed to build video sink".to_string())
+                log::error!("Failed to build waylandsink: {}", err);
+                Error::Pipeline("Failed to build waylandsink".to_string())
             })?;
 
-        // Create and set the Wayland display context
-        const WAYLAND_DISPLAY_HANDLE_CONTEXT_TYPE: &str = "GstWaylandDisplayHandleContextType";
-
-        let mut context = gst::Context::new(WAYLAND_DISPLAY_HANDLE_CONTEXT_TYPE, true);
-        {
-            let context = context.get_mut().unwrap();
-            let structure = context.structure_mut();
-
-            log::debug!(
-                "Setting display pointer in context: {:p}",
-                integration.display as *const _
-            );
-
-            unsafe {
-                use glib::translate::{ToGlibPtr, ToGlibPtrMut};
-                use gstreamer::ffi as gst_ffi;
-
-                let mut value = glib::Value::from_type(glib::Type::POINTER);
-                glib::gobject_ffi::g_value_set_pointer(
-                    value.to_glib_none_mut().0,
-                    integration.display,
-                );
-
-                gst_ffi::gst_structure_set_value(
-                    structure.as_ptr() as *mut gst_ffi::GstStructure,
-                    c"display".as_ptr(),
-                    value.to_glib_none().0,
-                );
-            }
-        }
-
-        video_sink.set_context(&context);
-        log::debug!("Wayland display context set on pipeline");
-
-        log::debug!("Setting initial subsurface size (will be updated by widget)");
-        subsurface.set_position(0, 0);
-        let init_w = bounds.2.max(1);
-        let init_h = bounds.3.max(1);
-        log::info!("[subs] Initial size from bounds: {}x{}", init_w, init_h);
-        subsurface.set_size(init_w, init_h); // Use provided bounds or minimum 1x1
-                                             // Proactively inform subtitle worker of initial size
-
-        // Now get the surface handle - it should have the correct size
-        let surface_handle = subsurface.surface_handle();
-        log::debug!(
-            "Setting waylandsink to use subsurface handle: 0x{:x}",
-            surface_handle
-        );
-
-        let video_overlay = video_sink
-            .dynamic_cast_ref::<VideoOverlay>()
-            .ok_or_else(|| Error::Pipeline("waylandsink doesn't implement VideoOverlay".into()))?;
-
-        unsafe {
-            video_overlay.set_window_handle(surface_handle);
-            if let Err(err) =
-                video_overlay.set_render_rectangle(bounds.0, bounds.1, bounds.2, bounds.3)
-            {
-                log::debug!("[ERROR] Failed to set initial render rectangle: {}", err);
-            }
-            video_overlay.expose();
-            video_overlay.handle_events(false);
-        }
-
-        video_sink.set_property("fullscreen", false); // Fullscreen true causes freeze with subsurface
+        video_sink.set_property("fullscreen", false);
 
         if video_sink.has_property("force-aspect-ratio") {
             video_sink.set_property("force-aspect-ratio", false);
         }
 
-        let vsink_bin = gst::Bin::with_name("waylandsink-bin");
-
-        // Insert a buffering queue to decouple upstream reconfiguration when subtitles are enabled
-        //let queue2 = gst::ElementFactory::make("queue2")
-        //    .name("video-buffer")
-        //    .property("use-buffering", true)
-        //    //.property("low-watermark", 0.25f64)
-        //    //.property("high-watermark", 0.85f64)
-        //    .property("max-size-buffers", 20u32)
-        //    //.property("max-size-time", 6_000_000_000u64) // 5s
-        //    //.property("max-size-bytes", 4_000_000u32)
-        //    .property("max-size-bytes", 0u32)
-        //    //.property("ring-buffer-max-size", 536870912u64)
-        //    //.property("use-bitrate-query", true)
-        //    //.property("use-rate-estimate", true)
-        //    .build()
-        //    .map_err(|err| {
-        //        println!("Failed to build video buffer queue2: {}", err);
-        //        Error::Pipeline("Failed to build queue2 for video sink".to_string())
-        //    })?;
-
+        // ── Build vapostproc ───────────────────────────────────────────
         let vapostproc = gst::ElementFactory::make("vapostproc")
             .name("vapostproc")
-            // Causes significant artifacting
             .property("add-borders", false)
-            // Fixes washed out hdr
             .property("disable-passthrough", true)
             .build()
             .map_err(|err| {
-                println!("Failed to build video sink: {}", err);
-                Error::Pipeline("Failed to build video sink".to_string())
+                log::error!("Failed to build vapostproc: {}", err);
+                Error::Pipeline("Failed to build vapostproc".to_string())
             })?;
 
-        // Should enable tone mapping on supported hardware
         if vapostproc.has_property("hdr-tone-mapping") {
             vapostproc.set_property("hdr-tone-mapping", true);
         }
 
+        // ── Assemble video-sink bin ────────────────────────────────────
+        let vsink_bin = gst::Bin::with_name("waylandsink-bin");
+
         vsink_bin
-            .add_many([(&vapostproc), &video_sink])
+            .add_many([&vapostproc, &video_sink])
             .map_err(|e| {
                 Error::Pipeline(format!("Failed to add elements to video-sink bin: {}", e))
             })?;
-        gst::Element::link_many([(&vapostproc), &video_sink])
+        gst::Element::link_many([&vapostproc, &video_sink])
             .map_err(|e| Error::Pipeline(format!("Failed to link video-sink chain: {}", e)))?;
 
-        // Create and add a ghost pad so playbin3 can link video into this bin through the buffer
         let ghost_pad = gst::GhostPad::with_target(&vapostproc.static_pad("sink").unwrap())
             .map_err(|e| {
-                Error::Pipeline(format!("Failed to create ghost pad for text-sink: {}", e))
+                Error::Pipeline(format!("Failed to create ghost pad for video-sink: {}", e))
             })?;
 
         vsink_bin.add_pad(&ghost_pad).map_err(|e| {
@@ -195,18 +170,97 @@ impl SubsurfacePipeline {
         })?;
 
         vsink_bin.set_property("message_forward", true);
-        // Should still test this
         vsink_bin.set_property("async-handling", false);
 
         pipeline.set_property("video-sink", vsink_bin);
 
+        // ── Prepare subsurface geometry ────────────────────────────────
+        log::debug!("Setting initial subsurface size (will be updated by widget)");
+        subsurface.set_position(0, 0);
+        let init_w = bounds.2.max(1);
+        let init_h = bounds.3.max(1);
+        log::info!("[subs] Initial size from bounds: {}x{}", init_w, init_h);
+        subsurface.set_size(init_w, init_h);
+
         subsurface.force_damage_and_commit();
         subsurface.flush()?;
         log::debug!("Forced damage and committed subsurface");
-        log::debug!("Pipeline ready for playback in PAUSED state");
 
-        // Enable debug subtitle overlay if env var is set
-        //let debug_subs = std::env::var_os("SUBWAVE_DEBUG_SUBS").is_some();
+        // ── Bus sync handler ───────────────────────────────────────────
+        // Runs synchronously on the GStreamer streaming thread whenever a
+        // message is posted.  We intercept the two Wayland-specific
+        // messages and provide the handles just-in-time, matching the
+        // pattern used in GStreamer's own waylandsink GTK example.
+        // Store pointer addresses as usize so the closure is Send+Sync.
+        // The Wayland objects behind these addresses live as long as
+        // WaylandSubsurfaceManager, which outlives the pipeline.
+        let display_addr: usize = integration.display as usize;
+        let surface_handle: usize = subsurface.surface_handle();
+        let init_bounds = bounds;
+
+        if let Some(bus) = pipeline.bus() {
+            bus.set_sync_handler(move |_bus, msg| {
+                match msg.view() {
+                    // waylandsink posts NEED_CONTEXT during NULL→READY to
+                    // ask for an external wl_display handle.
+                    gst::MessageView::NeedContext(nc) => {
+                        let ctx_type = nc.context_type();
+                        if ctx_type == "GstWaylandDisplayHandleContextType"
+                            || ctx_type == "GstWlDisplayHandleContextType"
+                        {
+                            log::info!(
+                                "[sync] Providing Wayland display context (type={ctx_type})"
+                            );
+                            let context = wayland_display_context(display_addr);
+                            if let Some(src) = msg.src() {
+                                if let Some(element) = src.downcast_ref::<gst::Element>() {
+                                    element.set_context(&context);
+                                }
+                            }
+                            return gst::BusSyncReply::Drop;
+                        }
+                    }
+
+                    // waylandsink posts an Element message named
+                    // "prepare-window-handle" just before rendering the
+                    // first frame.  We respond by supplying the wl_surface
+                    // handle and the initial render rectangle.
+                    gst::MessageView::Element(el) => {
+                        let is_prepare = el
+                            .structure()
+                            .is_some_and(|s| s.name().as_str() == "prepare-window-handle");
+                        if is_prepare {
+                            log::info!(
+                                "[sync] Providing window handle 0x{:x} and render rect {:?}",
+                                surface_handle,
+                                init_bounds
+                            );
+                            if let Some(src) = msg.src() {
+                                if let Some(overlay) = src.dynamic_cast_ref::<VideoOverlay>() {
+                                    unsafe {
+                                        overlay.set_window_handle(surface_handle);
+                                        let _ = overlay.set_render_rectangle(
+                                            init_bounds.0,
+                                            init_bounds.1,
+                                            init_bounds.2,
+                                            init_bounds.3,
+                                        );
+                                    }
+                                }
+                            }
+                            return gst::BusSyncReply::Drop;
+                        }
+                    }
+
+                    _ => {}
+                }
+                // All other messages pass through to the async bus
+                // (where the bus thread in video.rs picks them up).
+                gst::BusSyncReply::Pass
+            });
+        }
+
+        log::debug!("Pipeline ready (sync handler installed, awaiting state change)");
 
         Ok(Self {
             speed: 1.0,
@@ -250,7 +304,10 @@ impl SubsurfacePipeline {
 
     /// Stop playback
     pub fn stop(&self) -> Result<()> {
-        // Finally, stop the overall pipeline
+        // Stop the pipeline and clear the sync handler to break ref-cycles.
+        if let Some(bus) = self.pipeline.bus() {
+            bus.unset_sync_handler();
+        }
         self.pipeline
             .set_state(gst::State::Null)
             .map_err(|e| Error::Pipeline(format!("Failed to stop: {:?}", e)))?;
@@ -331,7 +388,6 @@ impl SubsurfacePipeline {
                     );
                 }
                 video_overlay.expose();
-                video_overlay.handle_events(true); // Still don't know what this does or if it's necessary
             }
         }
     }
@@ -364,8 +420,6 @@ impl SubsurfacePipeline {
     /// Get the current audio track index
     #[allow(dead_code)]
     pub fn current_audio_track(&self) -> i32 {
-        // For now, return the currently selected audio track
-        // This would need to be tracked properly in a real implementation
         self.pipeline.property::<i32>("current-audio")
     }
 
@@ -387,7 +441,12 @@ impl Drop for SubsurfacePipeline {
     fn drop(&mut self) {
         log::debug!("Beginning cleanup");
 
-        // First, stop the pipeline
+        // Clear the sync handler first to prevent callbacks during teardown
+        if let Some(bus) = self.pipeline.bus() {
+            bus.unset_sync_handler();
+        }
+
+        // Stop the pipeline
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
             log::error!("Error: Failed to set state to Null during cleanup: {:?}", e);
         }

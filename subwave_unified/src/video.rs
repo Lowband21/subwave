@@ -213,7 +213,9 @@ impl SubwaveVideo {
     /// Open media with additional options such as start position and headers.
     pub fn open(uri: &url::Url, options: OpenOptions) -> Result<Self, subwave_core::Error> {
         let backend = Self::select_backend(options.cfg);
-        let start = options.start_seconds.filter(|s| s.is_finite() && *s >= 0.0);
+        // Treat <= 0 as "no explicit start" to avoid an unnecessary startup seek-to-zero,
+        // which can trigger early pipeline reconfigure churn on some streams.
+        let start = options.start_seconds.filter(|s| s.is_finite() && *s > 0.0);
         match backend {
             BackendPreference::ForceAppsink => {
                 let video = if let Some(s) = start {

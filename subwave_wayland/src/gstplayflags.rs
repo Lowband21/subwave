@@ -4,6 +4,20 @@ pub mod gst_play_flags {
     };
     use std::fmt;
 
+    fn env_flag_enabled(name: &str) -> bool {
+        match std::env::var(name) {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                match v.as_str() {
+                    "" | "1" | "true" | "yes" | "on" => true,
+                    "0" | "false" | "no" | "off" => false,
+                    _ => true,
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
     bitflags::bitflags! {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub struct GstPlayFlags: u32 {
@@ -140,15 +154,23 @@ pub mod gst_play_flags {
         }
 
         pub fn wayland_native() -> Self {
-            // Wayland path renders subtitles via subwave_overlay, so we keep
-            // playbin's text handling disabled to avoid autoplugging CPU paths.
-            Self::VIDEO
-                | Self::AUDIO
-                | Self::TEXT
-                | Self::SOFT_VOLUME
-                | Self::BUFFERING
-                | Self::DEINTERLACE
-                | Self::NATIVE_VIDEO
+            // IMPORTANT: Do NOT combine TEXT + NATIVE_VIDEO here.
+            // In GStreamer 1.28, playsink may skip subtitleoverlay when
+            // NATIVE_VIDEO is set, which can leave text links invalid under
+            // some stream/topology changes.
+            //
+            // We intentionally omit NATIVE_VIDEO for stability.
+            //
+            // Debug knob:
+            //   SUBWAVE_DISABLE_TEXT=1  -> force subtitles off in playbin flags
+            let mut flags =
+                Self::VIDEO | Self::AUDIO | Self::SOFT_VOLUME | Self::BUFFERING | Self::DEINTERLACE;
+
+            if !env_flag_enabled("SUBWAVE_DISABLE_TEXT") {
+                flags |= Self::TEXT;
+            }
+
+            flags
         }
 
         pub fn network_no_subs() -> Self {
