@@ -11,7 +11,7 @@ use subwave_core::{
     video::types::{AudioTrack, SubtitleTrack},
 };
 
-use crate::{pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
+use crate::{pgs_decoder::PgsDecoder, pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
 
 // Internal encapsulates all state and is only accessed behind the RwLock
 pub(crate) struct Internal {
@@ -64,6 +64,13 @@ pub(crate) struct Internal {
 
     // Pending playback state to apply when pipeline is ready
     pub(crate) pending_state: Option<PendingState>,
+
+    // PGS subtitle decoder (bitmap subtitles)
+    pub(crate) pgs_decoder: PgsDecoder,
+    /// Stream IDs that are PGS/bitmap — NOT routed through playbin3's subtitle path
+    pub(crate) pgs_stream_ids: Vec<String>,
+    /// True when a PGS track is currently selected (enables the pad probe decoder)
+    pub(crate) pgs_active: Arc<AtomicBool>,
 
     // Pending HTTP headers to apply to pipeline when available
     pub(crate) pending_http_headers: Option<Vec<(String, String)>>,

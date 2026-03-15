@@ -1,5 +1,9 @@
 #[cfg(target_os = "linux")]
+pub mod color_management;
+#[cfg(target_os = "linux")]
 pub mod gstplayflags;
+#[cfg(target_os = "linux")]
+pub mod pgs_decoder;
 #[cfg(target_os = "linux")]
 pub mod internal;
 #[cfg(target_os = "linux")]

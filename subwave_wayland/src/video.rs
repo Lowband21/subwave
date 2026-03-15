@@ -66,6 +66,9 @@ impl Video for SubsurfaceVideo {
             user_paused: false,
             startup_async_done: false,
             pending_state: None,
+            pgs_decoder: crate::pgs_decoder::PgsDecoder::new(),
+            pgs_stream_ids: Vec::new(),
+            pgs_active: Arc::new(AtomicBool::new(false)),
             pending_http_headers: None,
             pending_play_after_seek: false,
             pending_start_position: None,
@@ -357,6 +360,9 @@ impl SubsurfaceVideo {
             user_paused: false,
             startup_async_done: false,
             pending_state: None,
+            pgs_decoder: crate::pgs_decoder::PgsDecoder::new(),
+            pgs_stream_ids: Vec::new(),
+            pgs_active: Arc::new(AtomicBool::new(false)),
             pending_http_headers: None,
             pending_play_after_seek: false,
             pending_start_position: None,
@@ -396,11 +402,15 @@ impl SubsurfaceVideo {
     ) -> Result<(), Error> {
         // Construct subsurface and pipeline (no lock held during external calls)
         let subsurface = WaylandSubsurfaceManager::new(integration.clone())?;
+        let compositor_has_cm = subsurface.has_color_management();
+        let pgs_active = self.0.read().pgs_active.clone();
         let pipeline = Arc::new(SubsurfacePipeline::new(
             &self.0.read().uri,
             &subsurface,
             &integration,
             bounds,
+            compositor_has_cm,
+            &pgs_active,
         )?);
 
         // Apply any pending HTTP headers context before starting message processing
@@ -497,6 +507,7 @@ impl SubsurfaceVideo {
                                     let mut first_video_id: Option<String> = None;
                                     let mut best_text_id: Option<String> = None; // text/x-raw preferred
                                     let mut any_text_id: Option<String> = None;
+                                    let mut pgs_ids: Vec<String> = Vec::new();
 
                                     for i in 0..n {
                                         if let Some(stream) = collection.stream(i as u32) {
@@ -558,18 +569,44 @@ impl SubsurfaceVideo {
                                                         codec = Some(v.get().to_string());
                                                     }
                                                 }
+                                                let mut is_text_sub = false;
+                                                let mut is_pgs_sub = false;
                                                 if let Some(c) = caps.as_ref().and_then(|c| c.structure(0)) {
                                                     if codec.is_none() { codec = Some(c.name().to_string()); }
-                                                    // Remember best raw text
-                                                    if c.name().starts_with("text/x-raw") && best_text_id.is_none() {
+                                                    let cap_name = c.name().as_str();
+                                                    is_text_sub = cap_name.starts_with("text/");
+                                                    is_pgs_sub = cap_name == "subpicture/x-pgs"
+                                                        || cap_name == "subpicture/x-dvd";
+                                                    if is_text_sub && best_text_id.is_none() {
                                                         best_text_id = Some(sid.to_string());
                                                     }
                                                 }
-                                                if any_text_id.is_none() { any_text_id = Some(sid.to_string()); }
 
-                                                let idx = subtitle_tracks.len() as i32;
-                                                subtitle_tracks.push(SubtitleTrack { index: idx, language, title, codec });
-                                                subtitle_ids.push(sid.to_string());
+                                                if is_pgs_sub {
+                                                    // PGS/DVD bitmap subs — track separately.
+                                                    // They appear in the UI track list but are NOT
+                                                    // routed through playbin3's SelectStreams (which
+                                                    // would activate subtitleoverlay and cause green
+                                                    // artifacts on HDR).  Instead, when selected, the
+                                                    // PGS decoder intercepts raw buffers via pad probe.
+                                                    log::info!(
+                                                        "[streams] PGS/bitmap subtitle stream {sid}: codec={codec:?}"
+                                                    );
+                                                    pgs_ids.push(sid.to_string());
+                                                    let idx = subtitle_tracks.len() as i32;
+                                                    subtitle_tracks.push(SubtitleTrack { index: idx, language, title, codec });
+                                                    subtitle_ids.push(sid.to_string());
+                                                } else if is_text_sub {
+                                                    if any_text_id.is_none() { any_text_id = Some(sid.to_string()); }
+                                                    let idx = subtitle_tracks.len() as i32;
+                                                    subtitle_tracks.push(SubtitleTrack { index: idx, language, title, codec });
+                                                    subtitle_ids.push(sid.to_string());
+                                                } else {
+                                                    log::info!(
+                                                        "[streams] Skipping unsupported subtitle format {sid}: codec={codec:?}"
+                                                    );
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }
@@ -637,6 +674,27 @@ impl SubsurfaceVideo {
 
                                     dedup_in_place(&mut selected_ids);
 
+                                    // Send SelectStreams to playbin3 so audio is
+                                    // included in the active selection.  Without
+                                    // this, GStreamer 1.28's internal re-selection
+                                    // (triggered by a text pad appearing) can drop
+                                    // the audio stream, leaving playback silent.
+                                    if !selected_ids.is_empty() {
+                                        let evt = gst::event::SelectStreams::new(
+                                            selected_ids.iter().map(|s| s.as_str()),
+                                        );
+                                        if gst_pipeline.send_event(evt) {
+                                            log::info!(
+                                                "[streams] Sent SelectStreams with {} ids",
+                                                selected_ids.len()
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                "[streams] Failed to send SelectStreams event"
+                                            );
+                                        }
+                                    }
+
                                     // Update internal state immediately to expose available tracks
                                     let coll_clone = collection.clone();
                                     let tx_tracks = tx.clone();
@@ -647,6 +705,7 @@ impl SubsurfaceVideo {
                                             s.available_subtitles = subtitle_tracks;
                                             s.audio_index_to_stream_id = audio_ids;
                                             s.subtitle_index_to_stream_id = subtitle_ids;
+                                            s.pgs_stream_ids = pgs_ids;
                                             s.selected_stream_ids = selected_ids;
                                             s.current_audio_track = current_audio_index;
                                             s.current_subtitle_track = current_sub_index;
@@ -688,11 +747,124 @@ impl SubsurfaceVideo {
                                     }
                                 }
                                 MessageView::AsyncDone(_) => {
+                                    // ── Detect HDR and update color management ──
+                                    // After a state transition completes (PAUSED→PLAYING,
+                                    // or after a seek) the caps are settled.  Query vsink
+                                    // for colorimetry and notify the subsurface manager.
+                                    if let Some(vsink) = gst_pipeline.by_name("vsink") {
+                                        if let Some(pad) = vsink.static_pad("sink") {
+                                            if let Some(caps) = pad.current_caps() {
+                                                if let Some(s) = caps.structure(0) {
+                                                    let colorimetry = s
+                                                        .get::<String>("colorimetry")
+                                                        .unwrap_or_default();
+                                                    let pixel_format = s
+                                                        .get::<String>("format")
+                                                        .or_else(|_| s.get::<String>("drm-format"))
+                                                        .unwrap_or_default();
+                                                    if !colorimetry.is_empty() {
+                                                        // Extract mastering display and content light level
+                                                        let mastering = s
+                                                            .get::<String>("mastering-display-info")
+                                                            .ok();
+                                                        let cll = s
+                                                            .get::<String>("content-light-level")
+                                                            .ok();
+
+                                                        let mut meta = crate::color_management::HdrMetadata {
+                                                            mastering_primaries: None,
+                                                            mastering_luminance_min: None,
+                                                            mastering_luminance_max: None,
+                                                            max_cll: None,
+                                                            max_fall: None,
+                                                        };
+                                                        if let Some(ref m) = mastering {
+                                                            if let Some((prims, max_lum, min_lum)) =
+                                                                crate::color_management::HdrMetadata::parse_mastering_display(m)
+                                                            {
+                                                                meta.mastering_primaries = Some(prims);
+                                                                meta.mastering_luminance_max = Some(max_lum);
+                                                                meta.mastering_luminance_min = Some(min_lum);
+                                                            }
+                                                        }
+                                                        if let Some(ref c) = cll {
+                                                            if let Some((max_cll, max_fall)) =
+                                                                crate::color_management::HdrMetadata::parse_content_light_level(c)
+                                                            {
+                                                                meta.max_cll = Some(max_cll);
+                                                                meta.max_fall = Some(max_fall);
+                                                            }
+                                                        }
+
+                                                        // Only tag as HDR if the pixel format
+                                                        // can actually carry HDR data.  If
+                                                        // vapostproc already tone-mapped to
+                                                        // BGRx/8-bit, the pixels are SDR even
+                                                        // if colorimetry metadata says PQ.
+                                                        let format_ok = crate::color_management::HdrMetadata::is_hdr_capable_format(&pixel_format);
+
+                                                        let tx_cm = tx.clone();
+                                                        let colorimetry_owned = colorimetry.clone();
+                                                        let pixel_fmt_owned = pixel_format.clone();
+                                                        let _ = tx_cm.send(Box::new(move |state: &mut Internal| {
+                                                            if let Some(ref subs) = state.subsurface {
+                                                                if format_ok {
+                                                                    subs.notify_video_colorimetry(
+                                                                        &colorimetry_owned,
+                                                                        Some(&meta),
+                                                                    );
+                                                                } else {
+                                                                    // 8-bit SDR pixel format — make sure
+                                                                    // the surface is NOT tagged as HDR
+                                                                    log::info!(
+                                                                        "[color-mgmt] Pixel format {pixel_fmt_owned} is SDR; \
+                                                                         NOT tagging surface as HDR despite PQ colorimetry"
+                                                                    );
+                                                                    subs.notify_video_colorimetry(
+                                                                        "sdr-override",
+                                                                        None,
+                                                                    );
+                                                                }
+                                                            }
+                                                        }));
+
+                                                        log::info!(
+                                                            "[color-mgmt] Detected colorimetry={colorimetry} format={pixel_format} hdr_capable={format_ok} mastering={mastering:?} cll={cll:?}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // If we are gating autoplay until seek completes, start playback now
                                     let tx_play = tx.clone();
                                     let pipeline_clone = gst_pipeline.clone();
                                     let _ = tx_play.send(Box::new(move |state: &mut Internal| {
                                         state.startup_async_done = true;
+
+                                        // Re-send SelectStreams after seek completes.
+                                        // A flushing seek (FLUSH_START → FLUSH_STOP)
+                                        // discards any queued events, including the
+                                        // SelectStreams we sent during StreamCollection.
+                                        // Without re-sending, GStreamer 1.28's internal
+                                        // re-selection can drop the audio stream,
+                                        // leaving playback silent with no PipeWire node.
+                                        if !state.selected_stream_ids.is_empty() {
+                                            if let Some(p) = state.pipeline.as_ref() {
+                                                let ids = state.selected_stream_ids.clone();
+                                                if p.send_select_streams(&ids) {
+                                                    log::info!(
+                                                        "[streams] Re-sent SelectStreams ({} ids) after seek/AsyncDone",
+                                                        ids.len()
+                                                    );
+                                                } else {
+                                                    log::warn!(
+                                                        "[streams] Failed to re-send SelectStreams after seek"
+                                                    );
+                                                }
+                                            }
+                                        }
 
                                         if state.pending_play_after_seek {
                                             // Optional check: confirm position advanced near target
@@ -898,17 +1070,20 @@ impl SubsurfaceVideo {
         self.set_volume(st.volume);
         self.set_muted(st.muted);
         let _ = self.set_playback_rate(st.speed);
-        // If autoplay-after-seek gating is enabled, do not start playback here; wait for AsyncDone
-        let gate = { self.0.read().pending_play_after_seek };
-        if gate {
-            let _ = self.pause();
-        } else {
-            if st.paused {
-                let _ = self.pause();
-            } else {
-                let _ = self.play();
-            }
+
+        // Always gate play() behind AsyncDone when we just did a flushing
+        // seek.  The seek flushes queued SelectStreams events, and calling
+        // play() immediately triggers a PAUSED→PLAYING transition whose
+        // text-pad activity can cause GStreamer 1.28 to re-select streams
+        // without audio.  By deferring play() to AsyncDone, we re-send
+        // SelectStreams *before* the PLAYING transition (see AsyncDone
+        // handler), ensuring audio stays selected.
+        if !st.paused {
+            let mut w = self.0.write();
+            w.pending_play_after_seek = true;
+            w.user_paused = false;
         }
+        let _ = self.pause();
         Ok(())
     }
 
@@ -1096,16 +1271,22 @@ impl SubsurfaceVideo {
     }
 
     pub fn select_subtitle_track(&self, index: Option<i32>) -> Result<(), Error> {
-        let (p, mut new_ids, old_ids, sub_ids) = {
+        let (p, mut new_ids, old_ids, sub_ids, pgs_ids, subsurface) = {
             let r = self.0.read();
             let p = r.pipeline.clone();
             let mut ids = r.selected_stream_ids.clone();
             let old_ids = ids.clone();
-            // Remove existing subtitle ids
             if !r.subtitle_index_to_stream_id.is_empty() {
                 ids.retain(|id| !r.subtitle_index_to_stream_id.iter().any(|sid| sid == id));
             }
-            (p, ids, old_ids, r.subtitle_index_to_stream_id.clone())
+            (
+                p,
+                ids,
+                old_ids,
+                r.subtitle_index_to_stream_id.clone(),
+                r.pgs_stream_ids.clone(),
+                r.subsurface.clone(),
+            )
         };
 
         let Some(p) = p else {
@@ -1114,6 +1295,8 @@ impl SubsurfaceVideo {
 
         let mut new_current: Option<i32> = None;
         let mut enabled = false;
+        let mut is_pgs = false;
+
         if let Some(i) = index {
             if i < 0 || (i as usize) >= sub_ids.len() {
                 return Err(Error::Pipeline(format!(
@@ -1122,13 +1305,47 @@ impl SubsurfaceVideo {
                 )));
             }
             let sid = sub_ids[i as usize].clone();
-            new_ids.push(sid);
+
+            // Check if this is a PGS/bitmap track
+            is_pgs = pgs_ids.contains(&sid);
+
+            if is_pgs {
+                // PGS: add to SelectStreams so the demuxer actually pushes
+                // data (our pad probe on the demuxer intercepts it for
+                // decoding). The text-sink is a fakesink so PGS caps
+                // negotiate fine — no green artifacts since subtitleoverlay
+                // is bypassed (text-sink replaces it).
+                log::info!("[subs] PGS track selected (index={i}, sid={sid}) — activating PGS decoder");
+                self.0.read().pgs_active.store(true, Ordering::Relaxed);
+                new_ids.push(sid);
+            } else {
+                // Text track — route through playbin3's text-sink
+                // Deactivate PGS decoder if it was active
+                self.0.read().pgs_active.store(false, Ordering::Relaxed);
+                new_ids.push(sid);
+            }
             new_current = Some(i);
             enabled = true;
+        } else {
+            // Subtitles disabled — clear the subtitle subsurface and deactivate PGS
+            self.0.read().pgs_active.store(false, Ordering::Relaxed);
+            if let Some(ref subs) = subsurface {
+                let _ = subs.clear_subtitle();
+            }
         }
         dedup_in_place(&mut new_ids);
 
-        // No-op: desired selection already active.
+        // For PGS tracks, we don't send SelectStreams (the PGS stream
+        // stays unselected in playbin3; we intercept it separately).
+        // Just update state.
+        if is_pgs {
+            let mut w = self.0.write();
+            w.current_subtitle_track = new_current;
+            w.subtitles_enabled = enabled;
+            return Ok(());
+        }
+
+        // No-op for text tracks: desired selection already active.
         if new_ids == old_ids {
             let mut w = self.0.write();
             w.current_subtitle_track = new_current;

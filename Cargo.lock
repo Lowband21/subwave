@@ -3159,6 +3159,7 @@ name = "subwave_wayland"
 version = "0.1.0"
 dependencies = [
  "gstreamer",
+ "gstreamer-app",
  "gstreamer-video",
  "gstreamer-video-sys",
  "iced",

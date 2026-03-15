@@ -24,12 +24,13 @@ iced_winit.workspace = true
 
 # Wayland client-side dependencies
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32.9", features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32.9", features = ["client", "unstable", "staging"] }
 wayland-backend = "0.3"
 raw-window-handle = "0.6"
 
 # GStreamer dependencies
 gstreamer.workspace = true
+gstreamer-app.workspace = true
 gstreamer-video.workspace = true
 gstreamer-video-sys.workspace = true
 
