@@ -230,25 +230,22 @@ impl SubsurfacePipeline {
 
         pipeline.set_property("video-sink", vsink_bin);
 
-        // ── Text sink: render subtitles to ARGB and push to subsurface ─
-        // Instead of letting playbin3's subtitleoverlay blend sRGB text
-        // directly into PQ video buffers (which produces green artifacts),
-        // we intercept the decoded text stream with textrender → appsink.
-        // textrender uses pango to rasterise text/x-raw into ARGB bitmaps.
-        // The appsink callback then pushes each frame to the Wayland
-        // subtitle subsurface, where the compositor composites it on top
-        // of the video surface in the correct color space.
-        if !disable_text {
-            match Self::build_text_sink(subsurface) {
-                Ok(text_bin) => {
-                    pipeline.set_property("text-sink", text_bin);
-                    log::info!("[pipeline] Installed text-sink (textrender → appsink → subtitle subsurface)");
-                }
-                Err(e) => {
-                    log::warn!("[pipeline] Failed to build text-sink, subtitles disabled: {e}");
-                }
-            }
-        }
+        // Do NOT set a custom text-sink on playbin3.
+        //
+        // Setting text-sink (even to a permissive fakesink) causes
+        // playbin3 to release the audio sink pad ~1-3 s into playback
+        // when the media contains PGS subtitle streams.  This is
+        // reproducible with plain gst-launch-1.0:
+        //
+        //   gst-launch-1.0 playbin3 uri=file:///…mkv text-sink=fakesink
+        //
+        // Leaving text-sink unset lets playbin3 use its default
+        // subtitleoverlay path, which handles PGS passthrough correctly
+        // and keeps audio alive.
+        //
+        // All subtitle rendering is handled out-of-band:
+        //   • PGS/bitmap — demuxer pad probes (install_pgs_probe)
+        //   • text/x-raw — (future) same approach
 
         // ── Prepare subsurface geometry ────────────────────────────────
         log::debug!("Setting initial subsurface size (will be updated by widget)");
@@ -336,18 +333,98 @@ impl SubsurfacePipeline {
             });
         }
 
+        // ── Prevent decodebin3 from selecting subtitle streams ────────
+        // When decodebin3 selects a PGS subtitle stream it cannot
+        // decode, it triggers a "missing plugins" reconfiguration that
+        // races with audio activation and tears down the audio chain.
+        // We reject all subtitle streams via decodebin3's
+        // "select-stream" signal so it never creates multiqueue slots
+        // for them.  Subtitle data is still available on the demuxer's
+        // source pads and intercepted by install_pgs_probe below.
+        Self::install_decodebin3_stream_filter(&pipeline);
+
         // ── PGS subtitle interception ───────────────────────────────────
         // Install a deep-element-added probe that watches for demuxer
         // subtitle pads and intercepts raw PGS data before it reaches
         // playbin3's subtitleoverlay (which would corrupt HDR video).
         Self::install_pgs_probe(&pipeline, subsurface, pgs_active);
 
-        log::debug!("Pipeline ready (sync handler installed, PGS probe armed, awaiting state change)");
+        log::debug!("Pipeline ready (sync handler installed, decodebin3 stream filter armed, PGS probe armed, awaiting state change)");
 
         Ok(Self {
             speed: 1.0,
             pipeline: Arc::new(pipeline),
         })
+    }
+
+    /// Tell every `decodebin3` inside the pipeline to skip subtitle streams.
+    ///
+    /// Connects to the `select-stream` signal emitted by `decodebin3` for
+    /// each stream in a new collection.  We return `0` (do not select) for
+    /// any stream whose type is `TEXT` (which covers `subpicture/x-pgs`,
+    /// `text/x-raw`, etc.) and `-1` (let decodebin decide) for everything
+    /// else.
+    ///
+    /// This prevents `decodebin3` from creating multiqueue slots for
+    /// subtitle streams, which avoids the "missing plugins"
+    /// reconfiguration that kills the audio chain when PGS subtitles
+    /// are present.
+    fn install_decodebin3_stream_filter(pipeline: &gst::Pipeline) {
+        let connect = |element: &gst::Element| {
+            let name = element.name().to_string();
+            // "select-stream" is emitted for each GstStream in the
+            // collection.  Return value:
+            //   -1 → let decodebin decide (default)
+            //    0 → do NOT select this stream
+            //    1 → force-select this stream
+            element.connect("select-stream", false, move |args| {
+                let stream = args[2]
+                    .get::<gst::Stream>()
+                    .expect("select-stream arg[2] is GstStream");
+                let stype = stream.stream_type();
+                if stype.contains(gst::StreamType::TEXT) {
+                    let sid = stream
+                        .stream_id()
+                        .unwrap_or_else(|| "<unknown>".into());
+                    log::info!(
+                        "[pipeline] {name}: rejecting subtitle stream {sid} via select-stream"
+                    );
+                    return Some(0i32.to_value());
+                }
+                // Let decodebin3 decide for audio/video
+                Some((-1i32).to_value())
+            });
+            log::info!(
+                "[pipeline] Connected select-stream filter on {}",
+                element.name()
+            );
+        };
+
+        // ① Handle decodebin3 elements that already exist (created
+        //    during playbin3 construction).
+        let iter = pipeline.iterate_recurse();
+        for el in iter {
+            if let Ok(el) = el {
+                let is_db3 = el
+                    .factory()
+                    .map(|f| f.name().as_str() == "decodebin3")
+                    .unwrap_or(false);
+                if is_db3 {
+                    connect(&el);
+                }
+            }
+        }
+
+        // ② Catch decodebin3 elements created later (URI switches).
+        pipeline.connect_deep_element_added(move |_pipeline, _bin, element| {
+            let is_db3 = element
+                .factory()
+                .map(|f| f.name().as_str() == "decodebin3")
+                .unwrap_or(false);
+            if is_db3 {
+                connect(element);
+            }
+        });
     }
 
     /// Build a text-sink bin for playbin3's `text-sink` property.
