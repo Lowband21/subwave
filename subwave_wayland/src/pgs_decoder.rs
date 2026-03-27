@@ -53,6 +53,12 @@ const SEG_PDS: u8 = 0x14; // Palette Definition Segment
 const SEG_ODS: u8 = 0x15; // Object Definition Segment
 const SEG_END: u8 = 0x80; // End of Display Set
 
+impl Default for PgsDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PgsDecoder {
     pub fn new() -> Self {
         Self {
@@ -82,10 +88,7 @@ impl PgsDecoder {
             // PGS segments: [type:1][size:2][payload:size]
             // Some muxers include the 2-byte "PG" sync (0x50 0x47) before
             // each segment — skip it if present.
-            if offset + 2 <= data.len()
-                && data[offset] == 0x50
-                && data[offset + 1] == 0x47
-            {
+            if offset + 2 <= data.len() && data[offset] == 0x50 && data[offset + 1] == 0x47 {
                 // Skip "PG" sync marker
                 offset += 2;
                 // After sync: [PTS:4][DTS:4][type:1][size:2][payload...]
@@ -108,7 +111,9 @@ impl PgsDecoder {
             if payload_end > data.len() {
                 log::debug!(
                     "[pgs] Segment truncated: type=0x{:02x} size={} but only {} bytes remain",
-                    seg_type, seg_size, data.len() - payload_start
+                    seg_type,
+                    seg_size,
+                    data.len() - payload_start
                 );
                 break;
             }
@@ -124,7 +129,11 @@ impl PgsDecoder {
                     log::debug!("[pgs] WDS segment ({} bytes)", payload.len());
                 }
                 SEG_PDS => {
-                    log::debug!("[pgs] PDS segment ({} bytes, {} entries)", payload.len(), (payload.len().saturating_sub(2)) / 5);
+                    log::debug!(
+                        "[pgs] PDS segment ({} bytes, {} entries)",
+                        payload.len(),
+                        (payload.len().saturating_sub(2)) / 5
+                    );
                     self.parse_pds(payload);
                 }
                 SEG_ODS => {
@@ -140,7 +149,11 @@ impl PgsDecoder {
                     result = Some(self.finish_display_set());
                 }
                 _ => {
-                    log::debug!("[pgs] Unknown segment type: 0x{:02x} at offset {}", seg_type, offset);
+                    log::debug!(
+                        "[pgs] Unknown segment type: 0x{:02x} at offset {}",
+                        seg_type,
+                        offset
+                    );
                     // Can't determine size — bail out of this buffer
                     break;
                 }
@@ -182,7 +195,8 @@ impl PgsDecoder {
             let _cropped = data[offset + 3];
             let x = u16::from_be_bytes([data[offset + 4], data[offset + 5]]);
             let y = u16::from_be_bytes([data[offset + 6], data[offset + 7]]);
-            self.compositions.push(CompositionObject { object_id, x, y });
+            self.compositions
+                .push(CompositionObject { object_id, x, y });
             offset += 8;
             // If cropped flag is set (0x40), skip 8 more bytes of crop data
             if _cropped & 0x40 != 0 {
@@ -208,8 +222,8 @@ impl PgsDecoder {
 
             // YCbCr (BT.709) → RGB conversion
             let r = (y_val + 1.402 * (cr - 128.0)).clamp(0.0, 255.0) as u8;
-            let g = (y_val - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0))
-                .clamp(0.0, 255.0) as u8;
+            let g =
+                (y_val - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0)).clamp(0.0, 255.0) as u8;
             let b = (y_val + 1.772 * (cb - 128.0)).clamp(0.0, 255.0) as u8;
 
             if idx < 256 {
@@ -260,9 +274,13 @@ impl PgsDecoder {
             }
         } else {
             // Continuation segment — append RLE data
-            let rle_data = &data[4..]; // skip object_id(2) + version(1) + seq_flag(1)
-            // Actually, continuation starts at offset 7 (after 3-byte data_length)
-            let rle_data = if data.len() > 7 { &data[7..] } else { &data[4..] };
+            let _rle_data = &data[4..]; // skip object_id(2) + version(1) + seq_flag(1)
+                                       // Actually, continuation starts at offset 7 (after 3-byte data_length)
+            let rle_data = if data.len() > 7 {
+                &data[7..]
+            } else {
+                &data[4..]
+            };
             if let Some(obj) = self.objects.iter_mut().find(|o| o.id == object_id) {
                 obj.rle.extend_from_slice(rle_data);
             }

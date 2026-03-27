@@ -248,10 +248,12 @@ impl ColorManager {
 
         if self.supports_set_luminances {
             if let Some(meta) = metadata {
-                if let (Some(max_raw), Some(min_raw)) = (meta.mastering_luminance_max, meta.mastering_luminance_min) {
-                    let min_lum = min_raw;                     // already × 10000
-                    let max_lum = (max_raw / 10000).max(1);   // convert to cd/m²
-                    let reference_lum = 203_u32;               // PQ reference white
+                if let (Some(max_raw), Some(min_raw)) =
+                    (meta.mastering_luminance_max, meta.mastering_luminance_min)
+                {
+                    let min_lum = min_raw; // already × 10000
+                    let max_lum = (max_raw / 10000).max(1); // convert to cd/m²
+                    let reference_lum = 203_u32; // PQ reference white
                     creator.set_luminances(min_lum, max_lum, reference_lum);
                     log::info!(
                         "[color-mgmt] Mastering luminance: min={min_raw}/10000 cd/m², max={max_lum} cd/m²"
@@ -271,10 +273,14 @@ impl ColorManager {
                 if let Some(prims) = meta.mastering_primaries {
                     let scale = |v: u32| -> i32 { (v * 20) as i32 };
                     creator.set_mastering_display_primaries(
-                        scale(prims[0]), scale(prims[1]),
-                        scale(prims[2]), scale(prims[3]),
-                        scale(prims[4]), scale(prims[5]),
-                        scale(prims[6]), scale(prims[7]),
+                        scale(prims[0]),
+                        scale(prims[1]),
+                        scale(prims[2]),
+                        scale(prims[3]),
+                        scale(prims[4]),
+                        scale(prims[5]),
+                        scale(prims[6]),
+                        scale(prims[7]),
                     );
                     log::info!("[color-mgmt] Set mastering display primaries from stream metadata");
                 }
@@ -287,16 +293,18 @@ impl ColorManager {
                 }
             }
         } else {
-            log::debug!("[color-mgmt] Skipping mastering primaries/CLL/FALL (not advertised by compositor)");
+            log::debug!(
+                "[color-mgmt] Skipping mastering primaries/CLL/FALL (not advertised by compositor)"
+            );
         }
 
         let desc = creator.create(qh, DescriptionRole::HdrPq);
 
         // Roundtrip to receive the ready/failed event for the description
         let mut state = super::subsurface_manager::State::new();
-        event_queue.roundtrip(&mut state).map_err(|e| {
-            crate::Error::Wayland(format!("Roundtrip for HDR desc: {}", e))
-        })?;
+        event_queue
+            .roundtrip(&mut state)
+            .map_err(|e| crate::Error::Wayland(format!("Roundtrip for HDR desc: {}", e)))?;
 
         // Apply to the video surface
         cm_surface.set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
@@ -306,9 +314,7 @@ impl ColorManager {
         self.video_tagged = true;
         self.applied_colorimetry = Some(colorimetry.to_string());
 
-        log::info!(
-            "[color-mgmt] Tagged video surface with BT.2020+PQ (colorimetry={colorimetry})"
-        );
+        log::info!("[color-mgmt] Tagged video surface with BT.2020+PQ (colorimetry={colorimetry})");
 
         Ok(())
     }

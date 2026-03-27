@@ -70,7 +70,7 @@ impl SubtitleWriter {
     fn get(&self) -> &WaylandSubsurfaceManager {
         // SAFETY: The WaylandSubsurfaceManager Arc is alive for the
         // lifetime of the pipeline (enforced by video.rs ownership).
-        unsafe { &*self.0.0 }
+        unsafe { &*self.0 .0 }
     }
 }
 
@@ -168,15 +168,11 @@ impl SubsurfacePipeline {
                 // the tone-mapping using the image description we set on the
                 // surface via wp-color-management-v1.
                 vapostproc.set_property("hdr-tone-mapping", false);
-                log::info!(
-                    "[pipeline] vapostproc hdr-tone-mapping DISABLED (compositor has CM)"
-                );
+                log::info!("[pipeline] vapostproc hdr-tone-mapping DISABLED (compositor has CM)");
             } else {
                 // No compositor CM — vapostproc must tone-map HDR→SDR itself.
                 vapostproc.set_property("hdr-tone-mapping", true);
-                log::info!(
-                    "[pipeline] vapostproc hdr-tone-mapping ENABLED (no compositor CM)"
-                );
+                log::info!("[pipeline] vapostproc hdr-tone-mapping ENABLED (no compositor CM)");
             }
         }
 
@@ -300,7 +296,9 @@ impl SubsurfacePipeline {
         // is preserved.
         Self::install_subtitle_probes(&pipeline, subsurface, active_sub_stream_id);
 
-        log::debug!("Pipeline ready (sync handler installed, subtitle probes armed, awaiting state change)");
+        log::debug!(
+            "Pipeline ready (sync handler installed, subtitle probes armed, awaiting state change)"
+        );
 
         Ok(Self {
             speed: 1.0,
@@ -324,7 +322,11 @@ impl SubsurfacePipeline {
         pad.sticky_event::<gst::event::StreamStart>(0)
             .and_then(|ev| {
                 let sid = ev.stream_id();
-                if sid.is_empty() { None } else { Some(sid.to_string()) }
+                if sid.is_empty() {
+                    None
+                } else {
+                    Some(sid.to_string())
+                }
             })
     }
 
@@ -333,10 +335,11 @@ impl SubsurfacePipeline {
         if pad.direction() != gst::PadDirection::Src {
             return None;
         }
-        let caps = pad.current_caps().or_else(|| {
-            pad.pad_template().map(|t| t.caps().to_owned())
-        });
-        let name = caps.as_ref()
+        let caps = pad
+            .current_caps()
+            .or_else(|| pad.pad_template().map(|t| t.caps().to_owned()));
+        let name = caps
+            .as_ref()
             .and_then(|c| c.structure(0))
             .map(|s| s.name().as_str().to_string())?;
 
@@ -386,7 +389,7 @@ impl SubsurfacePipeline {
                 if pad.direction() != gst::PadDirection::Src {
                     return;
                 }
-                Self::maybe_attach_subtitle_probe(pad, sw, &active_dyn, &el.name().to_string());
+                Self::maybe_attach_subtitle_probe(pad, sw, &active_dyn, el.name().as_ref());
             });
         });
     }
@@ -399,11 +402,17 @@ impl SubsurfacePipeline {
     ) {
         match Self::classify_pad(pad) {
             Some(SubtitlePadKind::Pgs) => {
-                log::info!("[subs] Attaching PGS probe on {element_name}:{}", pad.name());
+                log::info!(
+                    "[subs] Attaching PGS probe on {element_name}:{}",
+                    pad.name()
+                );
                 Self::attach_pgs_probe(pad, sw, active);
             }
             Some(SubtitlePadKind::Text) => {
-                log::info!("[subs] Attaching text probe on {element_name}:{}", pad.name());
+                log::info!(
+                    "[subs] Attaching text probe on {element_name}:{}",
+                    pad.name()
+                );
                 Self::attach_text_probe(pad, sw, active);
             }
             None => {}
@@ -423,7 +432,8 @@ impl SubsurfacePipeline {
         // Snapshot this pad's stream-id once caps are known.  For
         // dynamic pads the STREAM_START event may not have arrived yet,
         // so we lazily resolve it on the first buffer.
-        let pad_sid: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(Self::pad_stream_id(pad));
+        let pad_sid: std::sync::Mutex<Option<String>> =
+            std::sync::Mutex::new(Self::pad_stream_id(pad));
 
         pad.add_probe(gst::PadProbeType::BUFFER, move |probe_pad, info| {
             // Lazily resolve stream-id if we didn't get it at install time.
@@ -478,16 +488,24 @@ impl SubsurfacePipeline {
 
                         for dy in 0..scaled_fh {
                             let canvas_y = fy + dy;
-                            if canvas_y >= surf_h { break; }
+                            if canvas_y >= surf_h {
+                                break;
+                            }
                             let src_row = (dy as f64 / scale_y) as usize;
-                            if src_row >= fh { break; }
+                            if src_row >= fh {
+                                break;
+                            }
                             let s_off = src_row * src_stride;
 
                             for dx in 0..scaled_fw {
                                 let canvas_x = fx + dx;
-                                if canvas_x >= surf_w { break; }
+                                if canvas_x >= surf_w {
+                                    break;
+                                }
                                 let src_col = (dx as f64 / scale_x) as usize;
-                                if src_col >= fw { break; }
+                                if src_col >= fw {
+                                    break;
+                                }
 
                                 let s_px = s_off + src_col * 4;
                                 let d_px = canvas_y * stride + canvas_x * 4;
@@ -521,7 +539,8 @@ impl SubsurfacePipeline {
     ) {
         let writer = SubtitleWriter(sw);
         let active_id = Arc::clone(active);
-        let pad_sid: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(Self::pad_stream_id(pad));
+        let pad_sid: std::sync::Mutex<Option<String>> =
+            std::sync::Mutex::new(Self::pad_stream_id(pad));
         let renderer: std::sync::Mutex<Option<crate::text_renderer::TextRenderer>> =
             std::sync::Mutex::new(crate::text_renderer::TextRenderer::new());
 
@@ -554,10 +573,7 @@ impl SubsurfacePipeline {
                             return gst::PadProbeReturn::Ok;
                         }
 
-                        log::debug!(
-                            "[text-probe] subtitle: {}...",
-                            &text[..text.len().min(80)]
-                        );
+                        log::debug!("[text-probe] subtitle: {}...", &text[..text.len().min(80)]);
 
                         let rend = renderer.lock().unwrap();
                         if let Some(ref r) = *rend {
@@ -573,16 +589,15 @@ impl SubsurfacePipeline {
                                 );
                             }
                         } else {
-                            log::warn!("[text-probe] No font available — cannot render text subtitles");
+                            log::warn!(
+                                "[text-probe] No font available — cannot render text subtitles"
+                            );
                         }
 
                         gst::PadProbeReturn::Ok
                     }
                     Some(gst::PadProbeData::Event(ev)) => {
-                        if matches!(
-                            ev.type_(),
-                            gst::EventType::Gap | gst::EventType::FlushStart
-                        ) {
+                        if matches!(ev.type_(), gst::EventType::Gap | gst::EventType::FlushStart) {
                             let _ = writer.get().clear_subtitle();
                         }
                         gst::PadProbeReturn::Ok

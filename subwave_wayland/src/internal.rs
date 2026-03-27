@@ -1,5 +1,5 @@
 use std::{
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };

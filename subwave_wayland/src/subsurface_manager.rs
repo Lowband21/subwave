@@ -210,8 +210,7 @@ impl WaylandSubsurfaceManager {
             // created lazily when the video caps indicate HDR content (see
             // `notify_video_colorimetry`).  The subtitle surface is
             // deliberately left untagged so the compositor defaults to sRGB.
-            let mut color_manager =
-                ColorManager::bind_if_available(&state.globals, &registry, &qh);
+            let mut color_manager = ColorManager::bind_if_available(&state.globals, &registry, &qh);
             if let Some(ref mut cm) = color_manager {
                 // Roundtrip to receive the capability events (supported TFs, features, etc.)
                 event_queue.roundtrip(&mut state).map_err(|e| {
@@ -334,9 +333,7 @@ impl WaylandSubsurfaceManager {
 
             // Background: sync with parent (only changes on resize).
             background_subsurface.set_sync();
-            log::debug!(
-                "Subsurface modes: video=desync, subtitle=sync, background=sync"
-            );
+            log::debug!("Subsurface modes: video=desync, subtitle=sync, background=sync");
 
             // Z-ordering: video below parent, subtitle above parent
             video_subsurface.place_below(&parent_surface);
@@ -525,7 +522,11 @@ impl WaylandSubsurfaceManager {
         if data.len() < needed {
             return Err(Error::Wayland(format!(
                 "Subtitle data too small: {} < {} ({}x{} stride={})",
-                data.len(), needed, width, height, stride
+                data.len(),
+                needed,
+                width,
+                height,
+                stride
             )));
         }
         log::debug!(
@@ -831,13 +832,7 @@ impl WaylandSubsurfaceManager {
             // Take a single lock on the event queue for both the handle and the roundtrip
             let mut eq = self.event_queue.lock();
             let qh = eq.handle();
-            match cm.tag_video_hdr(
-                colorimetry,
-                metadata,
-                &self.video_surface,
-                &qh,
-                &mut eq,
-            ) {
+            match cm.tag_video_hdr(colorimetry, metadata, &self.video_surface, &qh, &mut eq) {
                 Ok(()) => {
                     drop(eq);
                     if let Err(e) = self.flush() {

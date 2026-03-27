@@ -993,7 +993,7 @@ impl SubsurfaceVideo {
             if st.subtitle_track.is_some() {
                 let _ = self.select_subtitle_track(st.subtitle_track);
             } else {
-                let _ = self.set_subtitles_enabled(true);
+                self.set_subtitles_enabled(true);
             }
         } else if self.subtitles_enabled() {
             let _ = self.select_subtitle_track(None);
@@ -1209,26 +1209,16 @@ impl SubsurfaceVideo {
     }
 
     pub fn select_subtitle_track(&self, index: Option<i32>) -> Result<(), Error> {
-        let (p, mut new_ids, old_ids, sub_ids, pgs_ids, subsurface) = {
+        let (sub_ids, pgs_ids, subsurface) = {
             let r = self.0.read();
-            let p = r.pipeline.clone();
-            let mut ids = r.selected_stream_ids.clone();
-            let old_ids = ids.clone();
-            if !r.subtitle_index_to_stream_id.is_empty() {
-                ids.retain(|id| !r.subtitle_index_to_stream_id.iter().any(|sid| sid == id));
+            if r.pipeline.is_none() {
+                return Err(Error::Pipeline("Video not initialized".into()));
             }
             (
-                p,
-                ids,
-                old_ids,
                 r.subtitle_index_to_stream_id.clone(),
                 r.pgs_stream_ids.clone(),
                 r.subsurface.clone(),
             )
-        };
-
-        let Some(p) = p else {
-            return Err(Error::Pipeline("Video not initialized".into()));
         };
 
         if let Some(i) = index {

@@ -183,8 +183,10 @@ impl TextRenderer {
         // A 3×3 max-filter gives a ~2px outline at typical scales.
         // Two passes (dilate twice) give ~4 px which is readable at 4K.
         let passes = if px >= 36.0 { 2 } else { 1 };
-        // Copy alpha → outline as starting point
-        bufs.outline.copy_from_slice(&bufs.alpha);
+        // Copy alpha → outline as starting point (split borrow via index copy)
+        for i in 0..canvas_size {
+            bufs.outline[i] = bufs.alpha[i];
+        }
         for _ in 0..passes {
             // We dilate in-place using a temporary read from `alpha`.
             // Swap roles each pass: outline is the latest dilated version.
