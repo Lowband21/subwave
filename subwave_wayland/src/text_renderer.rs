@@ -1,13 +1,16 @@
 //! Render subtitle text strings to pre-multiplied ARGB8888 bitmaps.
 //!
 //! Uses `ab_glyph` with a system TrueType font.  The rendered output is
-//! a full-canvas-sized transparent image with white, outlined text
-//! positioned at the bottom-center — ready to push directly to the
-//! Wayland subtitle subsurface via `attach_subtitle_frame`.
+//! a full-canvas-sized transparent image with white text and a dark
+//! shadow, positioned at the bottom-center — ready to push directly to
+//! the Wayland subtitle subsurface via `attach_subtitle_frame`.
+//!
+//! Rendering is designed to be fast enough to run inline on a GStreamer
+//! streaming thread without stalling video.  No per-pixel dilation or
+//! multi-pass filters — just two glyph passes (shadow + foreground).
 
 use ab_glyph::{point, Font, FontRef, Glyph, PxScale, ScaleFont};
 use once_cell::sync::OnceCell;
-use std::sync::Mutex;
 
 /// Common system font paths (bold preferred for subtitle readability).
 const FONT_SEARCH_PATHS: &[&str] = &[
@@ -63,25 +66,6 @@ fn load_font_data() -> Option<&'static [u8]> {
 /// font is loadable).  Actual rendering is stateless.
 pub struct TextRenderer;
 
-/// Scratch buffers reused across frames to avoid repeated allocation.
-struct ScratchBuffers {
-    /// Per-pixel alpha from glyph rasterisation (single channel).
-    alpha: Vec<u8>,
-    /// Dilated outline alpha (single channel).
-    outline: Vec<u8>,
-}
-
-static SCRATCH: OnceCell<Mutex<ScratchBuffers>> = OnceCell::new();
-
-fn scratch(canvas_size: usize) -> &'static Mutex<ScratchBuffers> {
-    SCRATCH.get_or_init(|| {
-        Mutex::new(ScratchBuffers {
-            alpha: vec![0u8; canvas_size],
-            outline: vec![0u8; canvas_size],
-        })
-    })
-}
-
 impl TextRenderer {
     /// Returns `None` if no usable font is found on the system.
     pub fn new() -> Option<Self> {
@@ -89,12 +73,15 @@ impl TextRenderer {
     }
 
     /// Render `text` onto a `canvas_w × canvas_h` pre-multiplied ARGB8888
-    /// buffer.  Text is white with a dark outline, centred horizontally,
-    /// near the bottom of the canvas.  Multi-line text (split on `\n`) is
+    /// buffer.  White text with a dark shadow, centred horizontally, near
+    /// the bottom of the canvas.  Multi-line text (split on `\n`) is
     /// supported.
     ///
-    /// Returns `None` if the font failed to parse (should not happen if
-    /// `new()` succeeded).
+    /// Performance: two glyph-rasterisation passes (shadow + foreground),
+    /// no per-pixel post-processing.  Typically <1 ms for a couple of
+    /// subtitle lines at 1080p.
+    ///
+    /// Returns `None` if the font failed to parse or text is empty.
     pub fn render(&self, text: &str, canvas_w: usize, canvas_h: usize) -> Option<Vec<u8>> {
         let font_data = load_font_data()?;
         let font = FontRef::try_from_slice(font_data).ok()?;
@@ -113,6 +100,10 @@ impl TextRenderer {
 
         let line_height = scaled.height() + scaled.line_gap();
         let ascent = scaled.ascent();
+
+        // Shadow offset in pixels (scales with font size).
+        let shadow_dx = (px / 16.0).max(1.0).round() as i32;
+        let shadow_dy = shadow_dx;
 
         // ── Layout all lines ──────────────────────────────────────────
         let mut laid_out: Vec<Vec<Glyph>> = Vec::with_capacity(lines.len());
@@ -139,16 +130,81 @@ impl TextRenderer {
         let margin_bottom = (canvas_h as f32 * 0.06).max(12.0);
         let block_top = (canvas_h as f32 - margin_bottom - total_text_h).max(0.0);
 
-        // ── Rasterise into a single-channel alpha buffer ──────────────
-        let canvas_size = canvas_w * canvas_h;
-        let scratch_mtx = scratch(canvas_size);
-        let mut bufs = scratch_mtx.lock().unwrap();
-        // Ensure buffers are large enough and zeroed.
-        bufs.alpha.resize(canvas_size, 0);
-        bufs.alpha.fill(0);
-        bufs.outline.resize(canvas_size, 0);
-        bufs.outline.fill(0);
+        let stride = canvas_w * 4;
+        let mut argb = vec![0u8; stride * canvas_h];
 
+        // ── Pass 1: shadow (dark, offset) ─────────────────────────────
+        self.rasterise_lines(
+            &font,
+            &laid_out,
+            &line_widths,
+            canvas_w,
+            canvas_h,
+            block_top,
+            ascent,
+            line_height,
+            shadow_dx,
+            shadow_dy,
+            &mut argb,
+            |off, cov, buf| {
+                // Pre-multiplied black at ~70% of glyph coverage.
+                let a = (cov * 0.7 * 255.0) as u8;
+                // "max" blend so overlapping shadow glyphs don't darken twice.
+                // Black premul: B=0 G=0 R=0 A=a
+                buf[off + 3] = buf[off + 3].max(a);
+            },
+        );
+
+        // ── Pass 2: foreground (white, no offset) ─────────────────────
+        self.rasterise_lines(
+            &font,
+            &laid_out,
+            &line_widths,
+            canvas_w,
+            canvas_h,
+            block_top,
+            ascent,
+            line_height,
+            0,
+            0,
+            &mut argb,
+            |off, cov, buf| {
+                // Pre-multiplied white "over" whatever is already there.
+                let fa = (cov * 255.0) as u8;
+                if fa == 0 {
+                    return;
+                }
+                let inv = 255u16 - fa as u16;
+                // ARGB8888 little-endian: [B, G, R, A]
+                buf[off] = (fa as u16 + (buf[off] as u16 * inv / 255)) as u8;
+                buf[off + 1] = (fa as u16 + (buf[off + 1] as u16 * inv / 255)) as u8;
+                buf[off + 2] = (fa as u16 + (buf[off + 2] as u16 * inv / 255)) as u8;
+                buf[off + 3] = (fa as u16 + (buf[off + 3] as u16 * inv / 255)) as u8;
+            },
+        );
+
+        Some(argb)
+    }
+
+    /// Rasterise laid-out glyph lines into `buf` via a caller-supplied
+    /// pixel callback `emit(byte_offset, coverage_0_to_1, buf)`.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterise_lines(
+        &self,
+        font: &FontRef<'_>,
+        laid_out: &[Vec<Glyph>],
+        line_widths: &[f32],
+        canvas_w: usize,
+        canvas_h: usize,
+        block_top: f32,
+        ascent: f32,
+        line_height: f32,
+        dx: i32,
+        dy: i32,
+        buf: &mut [u8],
+        emit: impl Fn(usize, f32, &mut [u8]),
+    ) {
+        let stride = canvas_w * 4;
         for (i, glyphs) in laid_out.iter().enumerate() {
             let lw = line_widths[i];
             let x_off = ((canvas_w as f32 - lw) / 2.0).max(0.0);
@@ -156,7 +212,10 @@ impl TextRenderer {
 
             for glyph in glyphs {
                 let positioned = Glyph {
-                    position: point(glyph.position.x + x_off, glyph.position.y + y_off),
+                    position: point(
+                        glyph.position.x + x_off + dx as f32,
+                        glyph.position.y + y_off + dy as f32,
+                    ),
                     ..glyph.clone()
                 };
                 if let Some(og) = font.outline_glyph(positioned) {
@@ -169,93 +228,13 @@ impl TextRenderer {
                             && py >= 0
                             && (py as usize) < canvas_h
                         {
-                            let idx = py as usize * canvas_w + px as usize;
-                            // Max-blend so overlapping glyphs don't over-brighten.
-                            let v = (cov * 255.0) as u8;
-                            bufs.alpha[idx] = bufs.alpha[idx].max(v);
+                            let off = py as usize * stride + px as usize * 4;
+                            emit(off, cov, buf);
                         }
                     });
                 }
             }
         }
-
-        // ── Build outline by dilating the alpha channel ───────────────
-        // A 3×3 max-filter gives a ~2px outline at typical scales.
-        // Two passes (dilate twice) give ~4 px which is readable at 4K.
-        let passes = if px >= 36.0 { 2 } else { 1 };
-        // Copy alpha → outline as starting point (split borrow via index copy)
-        for i in 0..canvas_size {
-            bufs.outline[i] = bufs.alpha[i];
-        }
-        for _ in 0..passes {
-            // We dilate in-place using a temporary read from `alpha`.
-            // Swap roles each pass: outline is the latest dilated version.
-            let src = bufs.outline.clone(); // TODO: avoid clone with double-buffer
-            for y in 0..canvas_h {
-                for x in 0..canvas_w {
-                    let mut mx = src[y * canvas_w + x];
-                    for dy in -1i32..=1 {
-                        for dx in -1i32..=1 {
-                            let nx = x as i32 + dx;
-                            let ny = y as i32 + dy;
-                            if nx >= 0
-                                && (nx as usize) < canvas_w
-                                && ny >= 0
-                                && (ny as usize) < canvas_h
-                            {
-                                mx = mx.max(src[ny as usize * canvas_w + nx as usize]);
-                            }
-                        }
-                    }
-                    bufs.outline[y * canvas_w + x] = mx;
-                }
-            }
-        }
-
-        // ── Composite into pre-multiplied ARGB8888 ────────────────────
-        // Outline = black (0,0,0) at outline alpha
-        // Foreground = white (255,255,255) at glyph alpha
-        // Standard "over" compositing with pre-multiplied values.
-        let stride = canvas_w * 4;
-        let mut argb = vec![0u8; stride * canvas_h];
-
-        for y in 0..canvas_h {
-            for x in 0..canvas_w {
-                let idx = y * canvas_w + x;
-                let fg_a = bufs.alpha[idx];
-                let ol_a = bufs.outline[idx];
-                if ol_a == 0 {
-                    continue;
-                }
-
-                // Background layer: black outline
-                // Pre-multiplied black: (B=0, G=0, R=0, A=ol_a)
-                let mut r = 0u16;
-                let mut g = 0u16;
-                let mut b = 0u16;
-                let mut a = ol_a as u16;
-
-                // Foreground layer: white text  ("over" onto outline)
-                // Pre-multiplied white: (B=fg_a, G=fg_a, R=fg_a, A=fg_a)
-                if fg_a > 0 {
-                    let fa = fg_a as u16;
-                    let inv = 255 - fa;
-                    b = fa + (b * inv / 255);
-                    g = fa + (g * inv / 255);
-                    r = fa + (r * inv / 255);
-                    a = fa + (a * inv / 255);
-                }
-
-                let off = y * stride + x * 4;
-                // ARGB8888 little-endian: [B, G, R, A]
-                argb[off] = b as u8;
-                argb[off + 1] = g as u8;
-                argb[off + 2] = r as u8;
-                argb[off + 3] = a as u8;
-            }
-        }
-
-        Some(argb)
     }
 }
 
