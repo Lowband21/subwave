@@ -4,20 +4,6 @@ pub mod gst_play_flags {
     };
     use std::fmt;
 
-    fn env_flag_enabled(name: &str) -> bool {
-        match std::env::var(name) {
-            Ok(v) => {
-                let v = v.trim().to_ascii_lowercase();
-                match v.as_str() {
-                    "" | "1" | "true" | "yes" | "on" => true,
-                    "0" | "false" | "no" | "off" => false,
-                    _ => true,
-                }
-            }
-            Err(_) => false,
-        }
-    }
-
     bitflags::bitflags! {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub struct GstPlayFlags: u32 {
@@ -154,23 +140,18 @@ pub mod gst_play_flags {
         }
 
         pub fn wayland_native() -> Self {
-            // IMPORTANT: Do NOT combine TEXT + NATIVE_VIDEO here.
-            // In GStreamer 1.28, playsink may skip subtitleoverlay when
-            // NATIVE_VIDEO is set, which can leave text links invalid under
-            // some stream/topology changes.
-            //
-            // We intentionally omit NATIVE_VIDEO for stability.
-            //
-            // Debug knob:
-            //   SUBWAVE_DISABLE_TEXT=1  -> force subtitles off in playbin flags
-            let mut flags =
-                Self::VIDEO | Self::AUDIO | Self::SOFT_VOLUME | Self::BUFFERING | Self::DEINTERLACE;
-
-            if !env_flag_enabled("SUBWAVE_DISABLE_TEXT") {
-                flags |= Self::TEXT;
-            }
-
-            flags
+            // Subtitle rendering is handled entirely out-of-band via
+            // demuxer pad probes (PGS bitmap and text/x-raw).  We omit
+            // TEXT so playbin3 never activates subtitleoverlay, which
+            // would interfere with HDR passthrough on the video chain.
+            // NATIVE_VIDEO is safe because subtitleoverlay is never
+            // involved.
+            Self::VIDEO
+                | Self::AUDIO
+                | Self::NATIVE_VIDEO
+                | Self::SOFT_VOLUME
+                | Self::BUFFERING
+                | Self::DEINTERLACE
         }
 
         pub fn network_no_subs() -> Self {

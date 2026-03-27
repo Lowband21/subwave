@@ -5,7 +5,7 @@ use crate::{
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkMutex, RwLock};
 use std::result::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -19,20 +19,6 @@ pub struct SubsurfaceVideo(pub(crate) RwLock<Internal>);
 
 // Bus commands are closures applied on Internal on the UI thread
 pub type Cmd = Box<dyn FnOnce(&mut Internal) + Send + 'static>;
-
-fn env_flag_enabled(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            match v.as_str() {
-                "" | "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                _ => true,
-            }
-        }
-        Err(_) => false,
-    }
-}
 
 // Implement the core Video trait for Wayland-backed SubsurfaceVideo
 impl Video for SubsurfaceVideo {
@@ -66,9 +52,8 @@ impl Video for SubsurfaceVideo {
             user_paused: false,
             startup_async_done: false,
             pending_state: None,
-            pgs_decoder: crate::pgs_decoder::PgsDecoder::new(),
             pgs_stream_ids: Vec::new(),
-            pgs_active: Arc::new(AtomicBool::new(false)),
+            active_sub_stream_id: Arc::new(ParkMutex::new(None)),
             pending_http_headers: None,
             pending_play_after_seek: false,
             pending_start_position: None,
@@ -360,9 +345,8 @@ impl SubsurfaceVideo {
             user_paused: false,
             startup_async_done: false,
             pending_state: None,
-            pgs_decoder: crate::pgs_decoder::PgsDecoder::new(),
             pgs_stream_ids: Vec::new(),
-            pgs_active: Arc::new(AtomicBool::new(false)),
+            active_sub_stream_id: Arc::new(ParkMutex::new(None)),
             pending_http_headers: None,
             pending_play_after_seek: false,
             pending_start_position: None,
@@ -403,14 +387,14 @@ impl SubsurfaceVideo {
         // Construct subsurface and pipeline (no lock held during external calls)
         let subsurface = WaylandSubsurfaceManager::new(integration.clone())?;
         let compositor_has_cm = subsurface.has_color_management();
-        let pgs_active = self.0.read().pgs_active.clone();
+        let active_sub_id = self.0.read().active_sub_stream_id.clone();
         let pipeline = Arc::new(SubsurfacePipeline::new(
             &self.0.read().uri,
             &subsurface,
             &integration,
             bounds,
             compositor_has_cm,
-            &pgs_active,
+            &active_sub_id,
         )?);
 
         // Apply any pending HTTP headers context before starting message processing
@@ -430,10 +414,7 @@ impl SubsurfaceVideo {
                 .spawn(move || {
                     use gst::MessageView;
 
-                    let disable_text = env_flag_enabled("SUBWAVE_DISABLE_TEXT");
-                    let mut forced_text_off = false;
-
-                    while !stop.load(Ordering::SeqCst) {
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                         if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) {
                             match msg.view() {
                                 MessageView::Eos(_) => {
@@ -618,22 +599,10 @@ impl SubsurfaceVideo {
                                     } else {
                                         -1
                                     };
-                                    let mut current_text_prop = if disable_text {
-                                        -1
-                                    } else if gst_pipeline.has_property("current-text") {
-                                        gst_pipeline.property::<i32>("current-text")
-                                    } else {
-                                        -1
-                                    };
-
                                     // Stabilize startup defaults without sending SelectStreams.
                                     if current_audio_prop < 0 && !audio_ids.is_empty() && gst_pipeline.has_property("current-audio") {
                                         gst_pipeline.set_property("current-audio", 0i32);
                                         current_audio_prop = 0;
-                                    }
-                                    if disable_text && current_text_prop >= 0 && gst_pipeline.has_property("current-text") {
-                                        gst_pipeline.set_property("current-text", -1i32);
-                                        current_text_prop = -1;
                                     }
 
                                     let mut selected_ids: Vec<String> = Vec::new();
@@ -652,25 +621,10 @@ impl SubsurfaceVideo {
                                         selected_ids.push(aid.clone());
                                     }
 
-                                    let mut subtitles_enabled = false;
-                                    let mut current_sub_index: Option<i32> = None;
-                                    if current_text_prop >= 0
-                                        && (current_text_prop as usize) < subtitle_ids.len()
-                                    {
-                                        subtitles_enabled = true;
-                                        current_sub_index = Some(current_text_prop);
-                                        selected_ids.push(subtitle_ids[current_text_prop as usize].clone());
-                                    } else if !disable_text {
-                                        // Keep legacy hint for UI when current-text is not exposed yet.
-                                        let chosen_text = best_text_id.or(any_text_id);
-                                        if env_flag_enabled("SUBWAVE_AUTO_ENABLE_SUBS") {
-                                            if let Some(tid) = chosen_text {
-                                                subtitles_enabled = true;
-                                                current_sub_index = Some(0);
-                                                selected_ids.push(tid);
-                                            }
-                                        }
-                                    }
+                                    // Subtitles start disabled — user selects via UI.
+                                    // Our pad probes handle rendering out-of-band.
+                                    let subtitles_enabled = false;
+                                    let current_sub_index: Option<i32> = None;
 
                                     dedup_in_place(&mut selected_ids);
 
@@ -729,23 +683,7 @@ impl SubsurfaceVideo {
                                     }
                                 }
                                 }
-                                MessageView::StateChanged(state_changed) => {
-                                    if let Some(src) = msg.src() {
-                                        if src.name() == gst_pipeline.name() {
-                                            let cur = state_changed.current();
-                                            if disable_text
-                                                && !forced_text_off
-                                                && (cur == gst::State::Paused
-                                                    || cur == gst::State::Playing)
-                                            {
-                                                if gst_pipeline.has_property("current-text") {
-                                                    gst_pipeline.set_property("current-text", -1i32);
-                                                }
-                                                forced_text_off = true;
-                                            }
-                                        }
-                                    }
-                                }
+                                MessageView::StateChanged(_state_changed) => {}
                                 MessageView::AsyncDone(_) => {
                                     // ── Detect HDR and update color management ──
                                     // After a state transition completes (PAUSED→PLAYING,
@@ -1293,10 +1231,6 @@ impl SubsurfaceVideo {
             return Err(Error::Pipeline("Video not initialized".into()));
         };
 
-        let mut new_current: Option<i32> = None;
-        let mut enabled = false;
-        let mut is_pgs = false;
-
         if let Some(i) = index {
             if i < 0 || (i as usize) >= sub_ids.len() {
                 return Err(Error::Pipeline(format!(
@@ -1305,65 +1239,40 @@ impl SubsurfaceVideo {
                 )));
             }
             let sid = sub_ids[i as usize].clone();
+            let is_pgs = pgs_ids.contains(&sid);
 
-            // Check if this is a PGS/bitmap track
-            is_pgs = pgs_ids.contains(&sid);
+            log::info!(
+                "[subs] Selecting subtitle index={i}, sid={sid}, pgs={}",
+                is_pgs
+            );
 
-            if is_pgs {
-                // PGS: add to SelectStreams so the demuxer actually pushes
-                // data (our pad probe on the demuxer intercepts it for
-                // decoding). The text-sink is a fakesink so PGS caps
-                // negotiate fine — no green artifacts since subtitleoverlay
-                // is bypassed (text-sink replaces it).
-                log::info!("[subs] PGS track selected (index={i}, sid={sid}) — activating PGS decoder");
-                self.0.read().pgs_active.store(true, Ordering::Relaxed);
-                new_ids.push(sid);
-            } else {
-                // Text track — route through playbin3's text-sink
-                // Deactivate PGS decoder if it was active
-                self.0.read().pgs_active.store(false, Ordering::Relaxed);
-                new_ids.push(sid);
-            }
-            new_current = Some(i);
-            enabled = true;
-        } else {
-            // Subtitles disabled — clear the subtitle subsurface and deactivate PGS
-            self.0.read().pgs_active.store(false, Ordering::Relaxed);
+            // Store the selected stream ID so the matching pad probe
+            // activates and all others stay silent.
+            *self.0.read().active_sub_stream_id.lock() = Some(sid.clone());
+
+            // Clear any stale frame from a previously-selected track.
             if let Some(ref subs) = subsurface {
                 let _ = subs.clear_subtitle();
             }
-        }
-        dedup_in_place(&mut new_ids);
 
-        // For PGS tracks, we don't send SelectStreams (the PGS stream
-        // stays unselected in playbin3; we intercept it separately).
-        // Just update state.
-        if is_pgs {
+            // Subtitle rendering is fully out-of-band via demuxer pad
+            // probes — we never send subtitle stream IDs through
+            // SelectStreams / playbin3 because that would activate
+            // subtitleoverlay and break HDR passthrough.
             let mut w = self.0.write();
-            w.current_subtitle_track = new_current;
-            w.subtitles_enabled = enabled;
-            return Ok(());
-        }
-
-        // No-op for text tracks: desired selection already active.
-        if new_ids == old_ids {
-            let mut w = self.0.write();
-            w.current_subtitle_track = new_current;
-            w.subtitles_enabled = enabled;
-            return Ok(());
-        }
-
-        let ok = p.send_select_streams(&new_ids);
-        if ok {
-            let mut w = self.0.write();
-            w.selected_stream_ids = new_ids;
-            w.current_subtitle_track = new_current;
-            w.subtitles_enabled = enabled;
+            w.current_subtitle_track = Some(i);
+            w.subtitles_enabled = true;
             Ok(())
         } else {
-            Err(Error::Pipeline(
-                "Failed to send SelectStreams for subtitles".into(),
-            ))
+            // Subtitles disabled — deactivate all probes and clear surface.
+            *self.0.read().active_sub_stream_id.lock() = None;
+            if let Some(ref subs) = subsurface {
+                let _ = subs.clear_subtitle();
+            }
+            let mut w = self.0.write();
+            w.current_subtitle_track = None;
+            w.subtitles_enabled = false;
+            Ok(())
         }
     }
 

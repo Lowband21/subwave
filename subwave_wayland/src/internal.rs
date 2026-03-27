@@ -1,17 +1,18 @@
 use std::{
-    sync::{atomic::AtomicBool, Arc},
+    sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use gstreamer::StreamCollection;
+use parking_lot::Mutex as ParkMutex;
 use std::sync::mpsc;
 use subwave_core::{
     types::PendingState,
     video::types::{AudioTrack, SubtitleTrack},
 };
 
-use crate::{pgs_decoder::PgsDecoder, pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
+use crate::{pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
 
 // Internal encapsulates all state and is only accessed behind the RwLock
 pub(crate) struct Internal {
@@ -65,12 +66,13 @@ pub(crate) struct Internal {
     // Pending playback state to apply when pipeline is ready
     pub(crate) pending_state: Option<PendingState>,
 
-    // PGS subtitle decoder (bitmap subtitles)
-    pub(crate) pgs_decoder: PgsDecoder,
     /// Stream IDs that are PGS/bitmap — NOT routed through playbin3's subtitle path
     pub(crate) pgs_stream_ids: Vec<String>,
-    /// True when a PGS track is currently selected (enables the pad probe decoder)
-    pub(crate) pgs_active: Arc<AtomicBool>,
+
+    /// The stream ID of the currently-selected subtitle track (PGS or text).
+    /// Pad probes compare their pad's stream ID against this value and only
+    /// decode when they match, so only the selected language is rendered.
+    pub(crate) active_sub_stream_id: Arc<ParkMutex<Option<String>>>,
 
     // Pending HTTP headers to apply to pipeline when available
     pub(crate) pending_http_headers: Option<Vec<(String, String)>>,

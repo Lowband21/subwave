@@ -5,6 +5,8 @@ pub mod gstplayflags;
 #[cfg(target_os = "linux")]
 pub mod pgs_decoder;
 #[cfg(target_os = "linux")]
+pub mod text_renderer;
+#[cfg(target_os = "linux")]
 pub mod internal;
 #[cfg(target_os = "linux")]
 mod pipeline;

@@ -1,6 +1,5 @@
 use gstreamer::glib;
 use gstreamer::{self as gst, prelude::*};
-use gstreamer_app as gst_app;
 use gstreamer_video::{
     prelude::{VideoOverlayExt, VideoOverlayExtManual},
     VideoOverlay,
@@ -42,20 +41,6 @@ fn wayland_display_context(display_addr: usize) -> gst::Context {
     context
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            match v.as_str() {
-                "" | "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                _ => true,
-            }
-        }
-        Err(_) => false,
-    }
-}
-
 /// A Send+Sync handle for pushing subtitle frames to the subsurface from
 /// GStreamer streaming threads.
 ///
@@ -89,6 +74,11 @@ impl SubtitleWriter {
     }
 }
 
+enum SubtitlePadKind {
+    Pgs,
+    Text,
+}
+
 pub struct SubsurfacePipeline {
     speed: f64,
     pub pipeline: Arc<gst::Pipeline>,
@@ -109,7 +99,7 @@ impl SubsurfacePipeline {
         integration: &WaylandIntegration,
         bounds: (i32, i32, i32, i32),
         compositor_has_cm: bool,
-        pgs_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        active_sub_stream_id: &Arc<parking_lot::Mutex<Option<String>>>,
     ) -> Result<Self> {
         gst::init()?;
 
@@ -129,23 +119,8 @@ impl SubsurfacePipeline {
         pipeline.set_property("uri", uri.as_str());
 
         let play_flags = GstPlayFlags::wayland_native();
-        let disable_text = env_flag_enabled("SUBWAVE_DISABLE_TEXT");
-        log::info!(
-            "[pipeline] playbin flags={} (SUBWAVE_DISABLE_TEXT={})",
-            play_flags,
-            disable_text
-        );
+        log::info!("[pipeline] playbin flags={}", play_flags);
         pipeline.set_property("flags", play_flags);
-
-        // Disable auto-selection of subtitle tracks at startup.
-        // playbin3 may auto-select a PGS track before our StreamCollection
-        // handler runs, causing a not-negotiated error (our text-sink only
-        // accepts text/x-raw, not subpicture/x-pgs).  We start with
-        // subtitles off and let the StreamCollection handler / user
-        // select the right track later.
-        if pipeline.has_property("current-text") {
-            pipeline.set_property("current-text", -1i32);
-        }
 
         // ── Build waylandsink ──────────────────────────────────────────
         // Do NOT set display context or window handle here.
@@ -229,23 +204,6 @@ impl SubsurfacePipeline {
         vsink_bin.set_property("async-handling", false);
 
         pipeline.set_property("video-sink", vsink_bin);
-
-        // Do NOT set a custom text-sink on playbin3.
-        //
-        // Setting text-sink (even to a permissive fakesink) causes
-        // playbin3 to release the audio sink pad ~1-3 s into playback
-        // when the media contains PGS subtitle streams.  This is
-        // reproducible with plain gst-launch-1.0:
-        //
-        //   gst-launch-1.0 playbin3 uri=file:///…mkv text-sink=fakesink
-        //
-        // Leaving text-sink unset lets playbin3 use its default
-        // subtitleoverlay path, which handles PGS passthrough correctly
-        // and keeps audio alive.
-        //
-        // All subtitle rendering is handled out-of-band:
-        //   • PGS/bitmap — demuxer pad probes (install_pgs_probe)
-        //   • text/x-raw — (future) same approach
 
         // ── Prepare subsurface geometry ────────────────────────────────
         log::debug!("Setting initial subsurface size (will be updated by widget)");
@@ -333,23 +291,16 @@ impl SubsurfacePipeline {
             });
         }
 
-        // ── Prevent decodebin3 from selecting subtitle streams ────────
-        // When decodebin3 selects a PGS subtitle stream it cannot
-        // decode, it triggers a "missing plugins" reconfiguration that
-        // races with audio activation and tears down the audio chain.
-        // We reject all subtitle streams via decodebin3's
-        // "select-stream" signal so it never creates multiqueue slots
-        // for them.  Subtitle data is still available on the demuxer's
-        // source pads and intercepted by install_pgs_probe below.
-        Self::install_decodebin3_stream_filter(&pipeline);
+        // ── Subtitle interception (PGS + text/x-raw) ──────────────────
+        // All subtitle rendering is handled out-of-band via demuxer pad
+        // probes.  Each probe reads its pad's stream-id and only decodes
+        // when it matches `active_sub_stream_id`, so switching languages
+        // activates exactly one probe.  playbin3 never sees TEXT in its
+        // flags, so subtitleoverlay is never involved and HDR passthrough
+        // is preserved.
+        Self::install_subtitle_probes(&pipeline, subsurface, active_sub_stream_id);
 
-        // ── PGS subtitle interception ───────────────────────────────────
-        // Install a deep-element-added probe that watches for demuxer
-        // subtitle pads and intercepts raw PGS data before it reaches
-        // playbin3's subtitleoverlay (which would corrupt HDR video).
-        Self::install_pgs_probe(&pipeline, subsurface, pgs_active);
-
-        log::debug!("Pipeline ready (sync handler installed, decodebin3 stream filter armed, PGS probe armed, awaiting state change)");
+        log::debug!("Pipeline ready (sync handler installed, subtitle probes armed, awaiting state change)");
 
         Ok(Self {
             speed: 1.0,
@@ -357,177 +308,55 @@ impl SubsurfacePipeline {
         })
     }
 
-    /// Tell every `decodebin3` inside the pipeline to skip subtitle streams.
-    ///
-    /// Connects to the `select-stream` signal emitted by `decodebin3` for
-    /// each stream in a new collection.  We return `0` (do not select) for
-    /// any stream whose type is `TEXT` (which covers `subpicture/x-pgs`,
-    /// `text/x-raw`, etc.) and `-1` (let decodebin decide) for everything
-    /// else.
-    ///
-    /// This prevents `decodebin3` from creating multiqueue slots for
-    /// subtitle streams, which avoids the "missing plugins"
-    /// reconfiguration that kills the audio chain when PGS subtitles
-    /// are present.
-    fn install_decodebin3_stream_filter(pipeline: &gst::Pipeline) {
-        let connect = |element: &gst::Element| {
-            let name = element.name().to_string();
-            // "select-stream" is emitted for each GstStream in the
-            // collection.  Return value:
-            //   -1 → let decodebin decide (default)
-            //    0 → do NOT select this stream
-            //    1 → force-select this stream
-            element.connect("select-stream", false, move |args| {
-                let stream = args[2]
-                    .get::<gst::Stream>()
-                    .expect("select-stream arg[2] is GstStream");
-                let stype = stream.stream_type();
-                if stype.contains(gst::StreamType::TEXT) {
-                    let sid = stream
-                        .stream_id()
-                        .unwrap_or_else(|| "<unknown>".into());
-                    log::info!(
-                        "[pipeline] {name}: rejecting subtitle stream {sid} via select-stream"
-                    );
-                    return Some(0i32.to_value());
-                }
-                // Let decodebin3 decide for audio/video
-                Some((-1i32).to_value())
-            });
-            log::info!(
-                "[pipeline] Connected select-stream filter on {}",
-                element.name()
-            );
-        };
+    // ── Unified subtitle interception (PGS + text/x-raw) ────────────
+    //
+    // All subtitle rendering bypasses playbin3's subtitleoverlay to
+    // preserve HDR video passthrough.  We install pad probes on the
+    // demuxer's source pads and intercept subtitle buffers directly.
+    //
+    // Each probe reads its pad's stream-id (from the STREAM_START sticky
+    // event) and compares it against `active_sub_stream_id`.  Only the
+    // probe whose stream-id matches will decode/render — all others
+    // return Ok immediately, so switching languages is instantaneous.
 
-        // ① Handle decodebin3 elements that already exist (created
-        //    during playbin3 construction).
-        let iter = pipeline.iterate_recurse();
-        for el in iter {
-            if let Ok(el) = el {
-                let is_db3 = el
-                    .factory()
-                    .map(|f| f.name().as_str() == "decodebin3")
-                    .unwrap_or(false);
-                if is_db3 {
-                    connect(&el);
-                }
-            }
+    /// Read the stream-id from a pad's sticky STREAM_START event.
+    fn pad_stream_id(pad: &gst::Pad) -> Option<String> {
+        pad.sticky_event::<gst::event::StreamStart>(0)
+            .and_then(|ev| {
+                let sid = ev.stream_id();
+                if sid.is_empty() { None } else { Some(sid.to_string()) }
+            })
+    }
+
+    /// Classify a demuxer source pad by its caps.
+    fn classify_pad(pad: &gst::Pad) -> Option<SubtitlePadKind> {
+        if pad.direction() != gst::PadDirection::Src {
+            return None;
         }
-
-        // ② Catch decodebin3 elements created later (URI switches).
-        pipeline.connect_deep_element_added(move |_pipeline, _bin, element| {
-            let is_db3 = element
-                .factory()
-                .map(|f| f.name().as_str() == "decodebin3")
-                .unwrap_or(false);
-            if is_db3 {
-                connect(element);
-            }
+        let caps = pad.current_caps().or_else(|| {
+            pad.pad_template().map(|t| t.caps().to_owned())
         });
-    }
+        let name = caps.as_ref()
+            .and_then(|c| c.structure(0))
+            .map(|s| s.name().as_str().to_string())?;
 
-    /// Build a text-sink bin for playbin3's `text-sink` property.
-    ///
-    /// Only handles `text/x-raw` (SRT, WebVTT, SSA/ASS, SUB, external files).
-    /// PGS/bitmap subtitles are intercepted separately via pad probes
-    /// (see `install_pgs_probe`).
-    ///
-    /// Pipeline: `textrender(monospace) → capsfilter(ARGB) → appsink → subsurface`
-    fn build_text_sink(subsurface: &Arc<WaylandSubsurfaceManager>) -> Result<gst::Element> {
-        // Use a simple fakesink that accepts ANY caps as the text-sink.
-        // This prevents playbin3's text chain from failing with
-        // not-negotiated when it encounters PGS or other non-text formats.
-        //
-        // Text subtitles (SRT/ASS/VTT) are handled by textrender which
-        // we wire up as a pad probe on the fakesink's sink pad — we
-        // intercept text/x-raw buffers, render them, and push to the
-        // subtitle subsurface. Non-text formats pass through to fakesink
-        // harmlessly (PGS is handled separately via the demuxer probe).
-        let fakesink = gst::ElementFactory::make("fakesink")
-            .name("sub_text_sink")
-            .property("sync", true)
-            .property("async", false)
-            .build()
-            .map_err(|e| Error::Pipeline(format!("text fakesink: {e}")))?;
-
-        let sub_writer = SubtitleWriter::new(subsurface);
-        let sub_clear = SubtitleWriter::new(subsurface);
-
-        // Buffer probe: intercept text/x-raw buffers and render subtitles.
-        // All other formats pass through to fakesink (silently consumed).
-        if let Some(sink_pad) = fakesink.static_pad("sink") {
-            sink_pad.add_probe(
-                gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH,
-                move |pad, info| {
-                    match &info.data {
-                        Some(gst::PadProbeData::Buffer(buffer)) => {
-                            // Check if caps are text/x-raw
-                            let is_text = pad
-                                .current_caps()
-                                .as_ref()
-                                .and_then(|c| c.structure(0))
-                                .is_some_and(|s| s.name().as_str() == "text/x-raw");
-
-                            if !is_text {
-                                return gst::PadProbeReturn::Ok; // let fakesink consume it
-                            }
-
-                            // Render text subtitle
-                            let Ok(map) = buffer.map_readable() else {
-                                return gst::PadProbeReturn::Ok;
-                            };
-                            let text = String::from_utf8_lossy(map.as_slice());
-                            if text.trim().is_empty() {
-                                let _ = sub_writer.get().clear_subtitle();
-                                return gst::PadProbeReturn::Ok;
-                            }
-
-                            // For now, log that we received text (textrender pipeline
-                            // will be wired up in a follow-up — the important thing is
-                            // the pipeline doesn't crash).
-                            log::info!("[text-sink] Received text subtitle: {}...",
-                                &text[..text.len().min(60)]);
-
-                            // TODO: render text to ARGB and push to subsurface
-                            // For now text subs won't be visible but PGS works.
-
-                            gst::PadProbeReturn::Ok
-                        }
-                        Some(gst::PadProbeData::Event(ev)) => {
-                            match ev.type_() {
-                                gst::EventType::Gap | gst::EventType::FlushStart => {
-                                    let _ = sub_clear.get().clear_subtitle();
-                                }
-                                _ => {}
-                            }
-                            gst::PadProbeReturn::Ok
-                        }
-                        _ => gst::PadProbeReturn::Ok,
-                    }
-                },
-            );
+        if name == "subpicture/x-pgs" || name == "subpicture/x-dvd" {
+            Some(SubtitlePadKind::Pgs)
+        } else if name.starts_with("text/") {
+            Some(SubtitlePadKind::Text)
+        } else {
+            None
         }
-
-        log::info!("[pipeline] Built text-sink: fakesink with text/x-raw buffer probe");
-        Ok(fakesink)
     }
 
-    /// Install a pad probe on playbin3's internal demuxer to intercept raw
-    /// PGS (`subpicture/x-pgs`) subtitle buffers before they reach
-    /// subtitleoverlay.
-    ///
-    /// Uses `connect_deep_element_added` on the pipeline to find elements
-    /// as playbin3 creates them.  When a pad with `subpicture/x-pgs` caps
-    /// appears, a buffer probe is installed that feeds data to the PGS
-    /// decoder, which outputs ARGB frames to the subtitle subsurface.
-    pub fn install_pgs_probe(
+    /// Install probes on every demuxer subtitle pad (PGS and text).
+    fn install_subtitle_probes(
         pipeline: &gst::Pipeline,
         subsurface: &Arc<WaylandSubsurfaceManager>,
-        pgs_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        active_id: &Arc<parking_lot::Mutex<Option<String>>>,
     ) {
         let sw_ptr = SubtitleWriter::new(subsurface).ptr();
-        let active = std::sync::Arc::clone(pgs_active);
+        let active = Arc::clone(active_id);
 
         pipeline.connect_deep_element_added(move |_pipeline, _bin, element| {
             let factory_name = element
@@ -536,207 +365,232 @@ impl SubsurfacePipeline {
                 .unwrap_or_default();
 
             // Only watch demuxer elements for subtitle pads.
-            // Installing signals on every internal element causes crashes.
             if !factory_name.contains("demux") {
                 return;
             }
 
             let element_name = element.name().to_string();
-            log::info!("[pgs] Watching demuxer {element_name} for PGS subtitle pads");
+            log::info!("[subs] Watching demuxer {element_name} for subtitle pads");
 
             let sw = sw_ptr;
-            let active_inner = std::sync::Arc::clone(&active);
+            let active_inner = Arc::clone(&active);
 
-            // Check existing source pads
+            // Probe existing source pads
             for pad in element.src_pads() {
-                if Self::is_pgs_pad(&pad) {
-                    log::info!("[pgs] Found PGS pad (existing) on {element_name}:{}", pad.name());
-                    Self::attach_pgs_buffer_probe(&pad, sw, &active_inner);
-                }
+                Self::maybe_attach_subtitle_probe(&pad, sw, &active_inner, &element_name);
             }
 
-            // Watch for dynamic pads (demuxers create pads as they parse)
-            let active_inner2 = std::sync::Arc::clone(&active_inner);
-            element.connect_pad_added(move |_el, pad| {
+            // Watch for dynamic pads
+            let active_dyn = Arc::clone(&active_inner);
+            element.connect_pad_added(move |el, pad| {
                 if pad.direction() != gst::PadDirection::Src {
                     return;
                 }
-                if Self::is_pgs_pad(pad) {
-                    log::info!("[pgs] Found PGS pad (dynamic) on {}:{}", _el.name(), pad.name());
-                    Self::attach_pgs_buffer_probe(pad, sw, &active_inner2);
-                }
+                Self::maybe_attach_subtitle_probe(pad, sw, &active_dyn, &el.name().to_string());
             });
         });
     }
 
-    fn is_pgs_pad(pad: &gst::Pad) -> bool {
-        if pad.direction() != gst::PadDirection::Src {
-            return false;
-        }
-        let caps = pad.current_caps().or_else(|| {
-            pad.pad_template().map(|t| t.caps().to_owned())
-        });
-        caps.as_ref()
-            .and_then(|c| c.structure(0))
-            .is_some_and(|s| {
-                let name = s.name().as_str();
-                name == "subpicture/x-pgs" || name == "subpicture/x-dvd"
-            })
-    }
-
-    fn attach_pgs_buffer_probe(
+    fn maybe_attach_subtitle_probe(
         pad: &gst::Pad,
         sw: SendPtr,
-        active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        active: &Arc<parking_lot::Mutex<Option<String>>>,
+        element_name: &str,
     ) {
-        let sw_probe = SubtitleWriter(sw);
+        match Self::classify_pad(pad) {
+            Some(SubtitlePadKind::Pgs) => {
+                log::info!("[subs] Attaching PGS probe on {element_name}:{}", pad.name());
+                Self::attach_pgs_probe(pad, sw, active);
+            }
+            Some(SubtitlePadKind::Text) => {
+                log::info!("[subs] Attaching text probe on {element_name}:{}", pad.name());
+                Self::attach_text_probe(pad, sw, active);
+            }
+            None => {}
+        }
+    }
+
+    /// PGS/bitmap subtitle probe — decodes PGS segments to ARGB and
+    /// pushes to the subtitle subsurface.
+    fn attach_pgs_probe(
+        pad: &gst::Pad,
+        sw: SendPtr,
+        active: &Arc<parking_lot::Mutex<Option<String>>>,
+    ) {
+        let writer = SubtitleWriter(sw);
         let decoder = std::sync::Mutex::new(crate::pgs_decoder::PgsDecoder::new());
-        let active_probe = std::sync::Arc::clone(active);
+        let active_id = Arc::clone(active);
+        // Snapshot this pad's stream-id once caps are known.  For
+        // dynamic pads the STREAM_START event may not have arrived yet,
+        // so we lazily resolve it on the first buffer.
+        let pad_sid: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(Self::pad_stream_id(pad));
 
-        pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-                    // Only decode when a PGS track is selected by the user
-                    if !active_probe.load(std::sync::atomic::Ordering::Relaxed) {
-                        return gst::PadProbeReturn::Ok; // let buffer flow normally
-                    }
+        pad.add_probe(gst::PadProbeType::BUFFER, move |probe_pad, info| {
+            // Lazily resolve stream-id if we didn't get it at install time.
+            {
+                let mut sid_guard = pad_sid.lock().unwrap();
+                if sid_guard.is_none() {
+                    *sid_guard = Self::pad_stream_id(probe_pad);
+                }
+                // Check whether this pad is the active subtitle track.
+                let selected = active_id.lock();
+                match (sid_guard.as_deref(), selected.as_deref()) {
+                    (Some(mine), Some(want)) if mine == want => {} // active — continue
+                    _ => return gst::PadProbeReturn::Ok,           // not selected — skip
+                }
+            }
 
-                    let Some(buffer) = info.buffer() else {
-                        return gst::PadProbeReturn::Ok;
-                    };
+            let Some(buffer) = info.buffer() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let Ok(map) = buffer.map_readable() else {
+                return gst::PadProbeReturn::Ok;
+            };
 
-                    let Ok(map) = buffer.map_readable() else {
-                        return gst::PadProbeReturn::Ok;
-                    };
+            log::debug!("[pgs-probe] Buffer: {} bytes", map.len());
 
-                    log::debug!("[pgs-probe] Buffer received: {} bytes", map.len());
+            let mut dec = decoder.lock().unwrap();
+            if let Some(frames) = dec.feed(map.as_slice()) {
+                let mgr = writer.get();
+                if frames.is_empty() {
+                    let _ = mgr.clear_subtitle();
+                } else {
+                    let (surf_w, surf_h) = mgr.get_size();
+                    let surf_w = surf_w.max(1) as usize;
+                    let surf_h = surf_h.max(1) as usize;
 
-                    let mut dec = decoder.lock().unwrap();
-                    if let Some(frames) = dec.feed(map.as_slice()) {
-                        let mgr = sw_probe.get();
-                        if frames.is_empty() {
-                            let _ = mgr.clear_subtitle();
-                        } else {
-                            // Get the subsurface display dimensions
-                            let (surf_w, surf_h) = mgr.get_size();
-                            let surf_w = surf_w.max(1) as usize;
-                            let surf_h = surf_h.max(1) as usize;
+                    let pgs_w = dec.video_width.max(1) as f64;
+                    let pgs_h = dec.video_height.max(1) as f64;
+                    let scale_x = surf_w as f64 / pgs_w;
+                    let scale_y = surf_h as f64 / pgs_h;
 
-                            // PGS coordinates are in the video's native resolution
-                            // (e.g. 3840x2076). Scale to subsurface dimensions.
-                            let pgs_w = dec.video_width.max(1) as f64;
-                            let pgs_h = dec.video_height.max(1) as f64;
-                            let scale_x = surf_w as f64 / pgs_w;
-                            let scale_y = surf_h as f64 / pgs_h;
+                    let stride = surf_w * 4;
+                    let mut canvas = vec![0u8; stride * surf_h];
 
-                            let stride = surf_w * 4;
-                            let mut canvas = vec![0u8; stride * surf_h];
+                    for frame in &frames {
+                        let fx = (frame.x as f64 * scale_x) as usize;
+                        let fy = (frame.y as f64 * scale_y) as usize;
+                        let fw = frame.width as usize;
+                        let fh = frame.height as usize;
+                        let scaled_fw = ((frame.width as f64) * scale_x) as usize;
+                        let scaled_fh = ((frame.height as f64) * scale_y) as usize;
+                        let src_stride = fw * 4;
 
-                            for frame in &frames {
-                                // Scale position and dimensions
-                                let fx = (frame.x as f64 * scale_x) as usize;
-                                let fy = (frame.y as f64 * scale_y) as usize;
-                                let fw = frame.width as usize;
-                                let fh = frame.height as usize;
-                                let scaled_fw = ((frame.width as f64) * scale_x) as usize;
-                                let scaled_fh = ((frame.height as f64) * scale_y) as usize;
-                                let src_stride = fw * 4;
+                        for dy in 0..scaled_fh {
+                            let canvas_y = fy + dy;
+                            if canvas_y >= surf_h { break; }
+                            let src_row = (dy as f64 / scale_y) as usize;
+                            if src_row >= fh { break; }
+                            let s_off = src_row * src_stride;
 
-                                // Simple nearest-neighbor scaling
-                                for dy in 0..scaled_fh {
-                                    let canvas_y = fy + dy;
-                                    if canvas_y >= surf_h { break; }
-                                    let src_row = (dy as f64 / scale_y) as usize;
-                                    if src_row >= fh { break; }
-                                    let s_off = src_row * src_stride;
+                            for dx in 0..scaled_fw {
+                                let canvas_x = fx + dx;
+                                if canvas_x >= surf_w { break; }
+                                let src_col = (dx as f64 / scale_x) as usize;
+                                if src_col >= fw { break; }
 
-                                    for dx in 0..scaled_fw {
-                                        let canvas_x = fx + dx;
-                                        if canvas_x >= surf_w { break; }
-                                        let src_col = (dx as f64 / scale_x) as usize;
-                                        if src_col >= fw { break; }
-
-                                        let s_px = s_off + src_col * 4;
-                                        let d_px = canvas_y * stride + canvas_x * 4;
-                                        if s_px + 4 <= frame.argb.len() && d_px + 4 <= canvas.len() {
-                                            canvas[d_px..d_px + 4].copy_from_slice(&frame.argb[s_px..s_px + 4]);
-                                        }
-                                    }
+                                let s_px = s_off + src_col * 4;
+                                let d_px = canvas_y * stride + canvas_x * 4;
+                                if s_px + 4 <= frame.argb.len() && d_px + 4 <= canvas.len() {
+                                    canvas[d_px..d_px + 4]
+                                        .copy_from_slice(&frame.argb[s_px..s_px + 4]);
                                 }
                             }
-
-                            let _ = mgr.attach_subtitle_frame(
-                                &canvas,
-                                surf_w as i32,
-                                surf_h as i32,
-                                stride as i32,
-                            );
                         }
                     }
 
-                    // Let the buffer continue downstream — playbin3 manages
-                    // its own subtitle routing.  We've copied the data we need.
-                    gst::PadProbeReturn::Ok
-                });
+                    let _ = mgr.attach_subtitle_frame(
+                        &canvas,
+                        surf_w as i32,
+                        surf_h as i32,
+                        stride as i32,
+                    );
+                }
+            }
+
+            gst::PadProbeReturn::Ok
+        });
     }
 
-    /// Appsink callback: composite the rendered subtitle ARGB bitmap onto
-    /// a full-surface-sized transparent canvas and push to the subtitle subsurface.
-    fn on_subtitle_sample(
-        sink: &gst_app::AppSink,
-        writer: &SubtitleWriter,
-    ) -> std::result::Result<gst::FlowSuccess, gst::FlowError> {
-        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-        let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-        let caps = sample.caps().ok_or(gst::FlowError::Error)?;
-        let s = caps.structure(0).ok_or(gst::FlowError::Error)?;
+    /// Text subtitle probe — renders text/x-raw to ARGB and pushes
+    /// to the subtitle subsurface.
+    fn attach_text_probe(
+        pad: &gst::Pad,
+        sw: SendPtr,
+        active: &Arc<parking_lot::Mutex<Option<String>>>,
+    ) {
+        let writer = SubtitleWriter(sw);
+        let active_id = Arc::clone(active);
+        let pad_sid: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(Self::pad_stream_id(pad));
+        let renderer: std::sync::Mutex<Option<crate::text_renderer::TextRenderer>> =
+            std::sync::Mutex::new(crate::text_renderer::TextRenderer::new());
 
-        let width = s.get::<i32>("width").unwrap_or(0);
-        let height = s.get::<i32>("height").unwrap_or(0);
-        if width <= 0 || height <= 0 {
-            return Ok(gst::FlowSuccess::Ok);
-        }
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |probe_pad, info| {
+                // Lazily resolve stream-id.
+                {
+                    let mut sid_guard = pad_sid.lock().unwrap();
+                    if sid_guard.is_none() {
+                        *sid_guard = Self::pad_stream_id(probe_pad);
+                    }
+                    let selected = active_id.lock();
+                    match (sid_guard.as_deref(), selected.as_deref()) {
+                        (Some(mine), Some(want)) if mine == want => {}
+                        _ => return gst::PadProbeReturn::Ok,
+                    }
+                }
 
-        let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-        let src_data = map.as_slice();
-        let src_stride = width as usize * 4;
+                match &info.data {
+                    Some(gst::PadProbeData::Buffer(buffer)) => {
+                        let Ok(map) = buffer.map_readable() else {
+                            return gst::PadProbeReturn::Ok;
+                        };
+                        let text = String::from_utf8_lossy(map.as_slice());
+                        let mgr = writer.get();
 
-        let mgr = writer.get();
-        let (sw, sh) = mgr.get_size();
-        let surf_w: i32 = sw.max(width);
-        let surf_h: i32 = sh.max(height);
-        let dest_stride = surf_w as usize * 4;
+                        if text.trim().is_empty() {
+                            let _ = mgr.clear_subtitle();
+                            return gst::PadProbeReturn::Ok;
+                        }
 
-        // textrender outputs a tight bounding box around the text.
-        // Composite it onto a full-sized transparent canvas, positioned
-        // at the bottom-center of the video area with a small margin.
-        let mut canvas = vec![0u8; dest_stride * surf_h as usize];
-        let margin_bottom = (surf_h as usize / 30).max(8);
-        let x_off = (surf_w as usize).saturating_sub(width as usize) / 2;
-        let y_off = (surf_h as usize)
-            .saturating_sub(height as usize)
-            .saturating_sub(margin_bottom);
+                        log::debug!(
+                            "[text-probe] subtitle: {}...",
+                            &text[..text.len().min(80)]
+                        );
 
-        for row in 0..height as usize {
-            let s_start = row * src_stride;
-            let s_end = s_start + src_stride;
-            if s_end > src_data.len() {
-                break;
-            }
-            let d_row = y_off + row;
-            if d_row >= surf_h as usize {
-                break;
-            }
-            let d_start = d_row * dest_stride + x_off * 4;
-            let d_end = d_start + src_stride;
-            if d_end <= canvas.len() {
-                canvas[d_start..d_end].copy_from_slice(&src_data[s_start..s_end]);
-            }
-        }
+                        let rend = renderer.lock().unwrap();
+                        if let Some(ref r) = *rend {
+                            let (w, h) = mgr.get_size();
+                            let w = w.max(1) as usize;
+                            let h = h.max(1) as usize;
+                            if let Some(argb) = r.render(&text, w, h) {
+                                let _ = mgr.attach_subtitle_frame(
+                                    &argb,
+                                    w as i32,
+                                    h as i32,
+                                    (w * 4) as i32,
+                                );
+                            }
+                        } else {
+                            log::warn!("[text-probe] No font available — cannot render text subtitles");
+                        }
 
-        if let Err(e) = mgr.attach_subtitle_frame(&canvas, surf_w, surf_h, surf_w * 4) {
-            log::warn!("[text-sink] Failed to attach text frame: {e}");
-        }
-
-        Ok(gst::FlowSuccess::Ok)
+                        gst::PadProbeReturn::Ok
+                    }
+                    Some(gst::PadProbeData::Event(ev)) => {
+                        if matches!(
+                            ev.type_(),
+                            gst::EventType::Gap | gst::EventType::FlushStart
+                        ) {
+                            let _ = writer.get().clear_subtitle();
+                        }
+                        gst::PadProbeReturn::Ok
+                    }
+                    _ => gst::PadProbeReturn::Ok,
+                }
+            },
+        );
     }
 
     /// Start playback

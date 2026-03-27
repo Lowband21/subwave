@@ -3158,6 +3158,7 @@ dependencies = [
 name = "subwave_wayland"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
