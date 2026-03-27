@@ -330,6 +330,18 @@ impl SubsurfacePipeline {
             })
     }
 
+    /// Compare a pad's stream-id against the user-selected stream-id.
+    ///
+    /// The StreamCollection (from decodebin3) uses fully-qualified paths
+    /// like `/GstPlayBin3:…/decodebin3-0/02_0005` while the demuxer pad's
+    /// STREAM_START event contains only the short tail (`02_0005`).
+    /// We accept a match if either ID is a suffix of the other.
+    fn stream_id_matches(pad_sid: &str, selected_sid: &str) -> bool {
+        pad_sid == selected_sid
+            || selected_sid.ends_with(pad_sid)
+            || pad_sid.ends_with(selected_sid)
+    }
+
     /// Classify a demuxer source pad by its caps.
     fn classify_pad(pad: &gst::Pad) -> Option<SubtitlePadKind> {
         if pad.direction() != gst::PadDirection::Src {
@@ -440,13 +452,16 @@ impl SubsurfacePipeline {
             {
                 let mut sid_guard = pad_sid.lock().unwrap();
                 if sid_guard.is_none() {
-                    *sid_guard = Self::pad_stream_id(probe_pad);
+                    if let Some(id) = Self::pad_stream_id(probe_pad) {
+                        log::info!("[pgs-probe] Resolved pad stream-id: {id}");
+                        *sid_guard = Some(id);
+                    }
                 }
                 // Check whether this pad is the active subtitle track.
                 let selected = active_id.lock();
                 match (sid_guard.as_deref(), selected.as_deref()) {
-                    (Some(mine), Some(want)) if mine == want => {} // active — continue
-                    _ => return gst::PadProbeReturn::Ok,           // not selected — skip
+                    (Some(mine), Some(want)) if Self::stream_id_matches(mine, want) => {}
+                    _ => return gst::PadProbeReturn::Ok,
                 }
             }
 
@@ -551,11 +566,14 @@ impl SubsurfacePipeline {
                 {
                     let mut sid_guard = pad_sid.lock().unwrap();
                     if sid_guard.is_none() {
-                        *sid_guard = Self::pad_stream_id(probe_pad);
+                        if let Some(id) = Self::pad_stream_id(probe_pad) {
+                            log::info!("[text-probe] Resolved pad stream-id: {id}");
+                            *sid_guard = Some(id);
+                        }
                     }
                     let selected = active_id.lock();
                     match (sid_guard.as_deref(), selected.as_deref()) {
-                        (Some(mine), Some(want)) if mine == want => {}
+                        (Some(mine), Some(want)) if Self::stream_id_matches(mine, want) => {}
                         _ => return gst::PadProbeReturn::Ok,
                     }
                 }
