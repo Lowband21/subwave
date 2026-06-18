@@ -8,6 +8,8 @@
 //! A complete subtitle frame ("display set") is assembled from multiple
 //! segments: PCS → WDS → PDS → ODS → END.
 
+use std::time::Duration;
+
 /// A fully decoded PGS subtitle image ready for display.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PgsFrame {
@@ -23,11 +25,32 @@ pub struct PgsFrame {
     pub y: u16,
 }
 
-/// Accumulates PGS segments and produces decoded frames.
+/// Presentation action represented by a complete PGS display set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgsDisplaySet {
+    /// Present one or more decoded composition objects.
+    Show(Vec<PgsFrame>),
+    /// Clear the currently visible subtitle composition.
+    Clear,
+}
+
+/// A decoded PGS display set with an optional raw PGS PTS timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimedPgsDisplaySet {
+    pub action: PgsDisplaySet,
+    /// Raw PGS segment PTS converted from 90 kHz ticks to stream time.
+    pub pts: Option<Duration>,
+}
+
+/// Accumulates PGS segments and produces decoded display sets.
 pub struct PgsDecoder {
     palette: Vec<[u8; 4]>, // 256 ARGB entries
     objects: Vec<OdsData>,
     compositions: Vec<CompositionObject>,
+    seen_pcs: bool,
+    pcs_composition_state: u8,
+    pcs_object_count: u8,
+    display_set_pts: Option<Duration>,
     /// Video dimensions from PCS (used for coordinate scaling)
     pub video_width: u16,
     pub video_height: u16,
@@ -54,6 +77,10 @@ const SEG_PDS: u8 = 0x14; // Palette Definition Segment
 const SEG_ODS: u8 = 0x15; // Object Definition Segment
 const SEG_END: u8 = 0x80; // End of Display Set
 
+fn pgs_timestamp_to_duration(timestamp_90khz: u32) -> Duration {
+    Duration::from_nanos((timestamp_90khz as u64).saturating_mul(1_000_000_000) / 90_000)
+}
+
 impl Default for PgsDecoder {
     fn default() -> Self {
         Self::new()
@@ -66,6 +93,10 @@ impl PgsDecoder {
             palette: vec![[0, 0, 0, 0]; 256],
             objects: Vec::new(),
             compositions: Vec::new(),
+            seen_pcs: false,
+            pcs_composition_state: 0,
+            pcs_object_count: 0,
+            display_set_pts: None,
             video_width: 1920,
             video_height: 1080,
         }
@@ -78,10 +109,10 @@ impl PgsDecoder {
     ///   [1B type][2B size][...payload...]
     ///
     /// This method loops through all segments in the buffer and returns
-    /// decoded frames when an END segment is encountered.
-    /// An empty `Vec` means "clear the subtitle" (composition with no objects).
-    pub fn feed(&mut self, data: &[u8]) -> Option<Vec<PgsFrame>> {
-        let mut result: Option<Vec<PgsFrame>> = None;
+    /// decoded display-set actions when an END segment is encountered. Display
+    /// sets without a PCS are resource updates/preloads and do not emit actions.
+    pub fn feed(&mut self, data: &[u8]) -> Vec<TimedPgsDisplaySet> {
+        let mut results = Vec::new();
         let mut offset = 0usize;
 
         while offset < data.len() {
@@ -89,6 +120,7 @@ impl PgsDecoder {
             // PGS segments: [type:1][size:2][payload:size]
             // Some muxers include the 2-byte "PG" sync (0x50 0x47) before
             // each segment — skip it if present.
+            let mut segment_pts = None;
             if offset + 2 <= data.len() && data[offset] == 0x50 && data[offset + 1] == 0x47 {
                 // Skip "PG" sync marker
                 offset += 2;
@@ -96,6 +128,13 @@ impl PgsDecoder {
                 if offset + 11 > data.len() {
                     break;
                 }
+                let pts = u32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                segment_pts = Some(pgs_timestamp_to_duration(pts));
                 // Skip PTS(4) + DTS(4) to get to type
                 offset += 8;
             }
@@ -121,6 +160,12 @@ impl PgsDecoder {
 
             let payload = &data[payload_start..payload_end];
 
+            if let Some(pts) = segment_pts {
+                if self.display_set_pts.is_none() || seg_type == SEG_PCS {
+                    self.display_set_pts = Some(pts);
+                }
+            }
+
             match seg_type {
                 SEG_PCS => {
                     log::debug!("[pgs] PCS segment ({} bytes)", payload.len());
@@ -142,12 +187,18 @@ impl PgsDecoder {
                     self.parse_ods(payload);
                 }
                 SEG_END => {
+                    let pts = self.display_set_pts;
                     log::info!(
-                        "[pgs] END — display set complete ({} objects, {} compositions)",
+                        "[pgs] END — display set complete ({} objects, {} compositions, pcs={}, state=0x{:02x}, pts={:?})",
                         self.objects.len(),
-                        self.compositions.len()
+                        self.compositions.len(),
+                        self.seen_pcs,
+                        self.pcs_composition_state,
+                        pts
                     );
-                    result = Some(self.finish_display_set());
+                    if let Some(action) = self.finish_display_set() {
+                        results.push(TimedPgsDisplaySet { action, pts });
+                    }
                 }
                 _ => {
                     log::debug!(
@@ -163,7 +214,7 @@ impl PgsDecoder {
             offset = payload_end;
         }
 
-        result
+        results
     }
 
     fn parse_pcs(&mut self, data: &[u8]) {
@@ -179,6 +230,9 @@ impl PgsDecoder {
         // data[9] = palette_id
         let num_objects = data[10];
 
+        self.seen_pcs = true;
+        self.pcs_composition_state = composition_state;
+        self.pcs_object_count = num_objects;
         self.compositions.clear();
 
         if composition_state == 0x00 && num_objects == 0 {
@@ -300,11 +354,24 @@ impl PgsDecoder {
         }
     }
 
-    fn finish_display_set(&mut self) -> Vec<PgsFrame> {
+    fn finish_display_set(&mut self) -> Option<PgsDisplaySet> {
+        if !self.seen_pcs {
+            // Some streams split palette/object resource updates into standalone
+            // display sets.  They update decoder state for future compositions
+            // but must not clear the currently visible subtitle.
+            self.reset_display_set_state();
+            return None;
+        }
+
+        if self.pcs_object_count == 0 {
+            let is_normal_clear = self.pcs_composition_state == 0x00;
+            self.reset_display_set_state();
+            return is_normal_clear.then_some(PgsDisplaySet::Clear);
+        }
+
         if self.compositions.is_empty() {
-            // No composition objects = clear subtitle
-            self.objects.clear();
-            return Vec::new();
+            self.reset_display_set_state();
+            return None;
         }
 
         let mut frames = Vec::new();
@@ -336,8 +403,21 @@ impl PgsDecoder {
 
         // Don't clear objects — they may be referenced by future compositions
         // (PGS allows reusing objects across display sets)
+        self.reset_display_set_state();
+
+        if frames.is_empty() {
+            None
+        } else {
+            Some(PgsDisplaySet::Show(frames))
+        }
+    }
+
+    fn reset_display_set_state(&mut self) {
+        self.seen_pcs = false;
+        self.pcs_composition_state = 0;
+        self.pcs_object_count = 0;
+        self.display_set_pts = None;
         self.compositions.clear();
-        frames
     }
 
     fn decode_rle(&self, obj: &OdsData) -> Result<Vec<u8>, String> {
@@ -433,5 +513,158 @@ impl PgsDecoder {
             buf[offset + 2] = r;
             buf[offset + 3] = a;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PgsDecoder, PgsDisplaySet, TimedPgsDisplaySet};
+    use std::time::Duration;
+
+    fn segment(segment_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(3 + payload.len());
+        data.push(segment_type);
+        data.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn end_segment() -> Vec<u8> {
+        segment(0x80, &[])
+    }
+
+    fn pcs_payload(num_objects: u8) -> Vec<u8> {
+        pcs_payload_with_state(0x00, num_objects)
+    }
+
+    fn pcs_payload_with_state(composition_state: u8, num_objects: u8) -> Vec<u8> {
+        let mut payload = vec![
+            0x07,
+            0x80, // width 1920
+            0x04,
+            0x38, // height 1080
+            0x10, // frame rate marker
+            0x00,
+            0x01, // composition number
+            composition_state,
+            0x00, // palette update flag
+            0x00, // palette id
+            num_objects,
+        ];
+
+        if num_objects > 0 {
+            payload.extend_from_slice(&[
+                0x00, 0x01, // object id
+                0x00, // window id
+                0x00, // cropped flag
+                0x00, 0x0a, // x
+                0x00, 0x14, // y
+            ]);
+        }
+
+        payload
+    }
+
+    fn ods_payload() -> Vec<u8> {
+        vec![
+            0x00, 0x01, // object id
+            0x00, // object version
+            0xc0, // first and last ODS fragment
+            0x00, 0x00, 0x05, // object data length
+            0x00, 0x01, // width
+            0x00, 0x01, // height
+            0x01, // one pixel using palette index 1
+        ]
+    }
+
+    fn pds_payload() -> Vec<u8> {
+        vec![
+            0x00, // palette id
+            0x00, // palette version
+            0x01, // entry id
+            0xeb, // Y
+            0x80, // Cr
+            0x80, // Cb
+            0xff, // alpha
+        ]
+    }
+
+    #[test]
+    fn object_only_display_sets_are_resource_updates_not_clears() {
+        let mut decoder = PgsDecoder::new();
+        let mut data = segment(0x15, &ods_payload());
+        data.extend_from_slice(&end_segment());
+
+        assert!(decoder.feed(&data).is_empty());
+    }
+
+    #[test]
+    fn zero_object_normal_pcs_display_sets_emit_clear() {
+        let mut decoder = PgsDecoder::new();
+        let mut data = segment(0x16, &pcs_payload(0));
+        data.extend_from_slice(&end_segment());
+
+        assert_eq!(
+            decoder.feed(&data),
+            vec![TimedPgsDisplaySet {
+                action: PgsDisplaySet::Clear,
+                pts: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn zero_object_epoch_and_acquisition_pcs_display_sets_do_not_clear() {
+        for composition_state in [0x40, 0x80] {
+            let mut decoder = PgsDecoder::new();
+            let mut data = segment(0x16, &pcs_payload_with_state(composition_state, 0));
+            data.extend_from_slice(&end_segment());
+
+            assert!(decoder.feed(&data).is_empty());
+        }
+    }
+
+    #[test]
+    fn composition_display_sets_emit_show() {
+        let mut decoder = PgsDecoder::new();
+        let mut data = segment(0x14, &pds_payload());
+        data.extend_from_slice(&segment(0x15, &ods_payload()));
+        data.extend_from_slice(&segment(0x16, &pcs_payload(1)));
+        data.extend_from_slice(&end_segment());
+
+        let display_sets = decoder.feed(&data);
+        assert_eq!(display_sets.len(), 1);
+        match &display_sets[0].action {
+            PgsDisplaySet::Show(frames) => {
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].width, 1);
+                assert_eq!(frames[0].height, 1);
+                assert_eq!(frames[0].x, 10);
+                assert_eq!(frames[0].y, 20);
+            }
+            PgsDisplaySet::Clear => panic!("composition display set unexpectedly cleared"),
+        }
+    }
+
+    #[test]
+    fn pgs_segment_headers_provide_display_set_pts() {
+        let pts_90khz = 180_000u32;
+        let payload = pcs_payload(0);
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PG");
+        data.extend_from_slice(&pts_90khz.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.push(0x16);
+        data.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        data.extend_from_slice(&payload);
+        data.extend_from_slice(&end_segment());
+
+        assert_eq!(
+            PgsDecoder::new().feed(&data),
+            vec![TimedPgsDisplaySet {
+                action: PgsDisplaySet::Clear,
+                pts: Some(Duration::from_secs(2)),
+            }]
+        );
     }
 }

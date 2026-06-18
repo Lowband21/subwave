@@ -86,6 +86,37 @@ impl PadSubtitleTiming {
     }
 }
 
+fn pgs_display_set_event(
+    stream_id: String,
+    generation: u64,
+    start: Duration,
+    display_set: crate::pgs_decoder::PgsDisplaySet,
+    video_width: u16,
+    video_height: u16,
+) -> crate::subtitle_scheduler::DecodedSubtitleEvent<WaylandSubtitlePayload> {
+    match display_set {
+        crate::pgs_decoder::PgsDisplaySet::Clear => {
+            crate::subtitle_scheduler::DecodedSubtitleEvent::clear(stream_id, generation, start)
+        }
+        crate::pgs_decoder::PgsDisplaySet::Show(frames) => {
+            // PGS display sets are stateful: a non-empty display set remains visible
+            // until a later display set replaces it or an empty composition clears it.
+            // The GstBuffer duration describes packet timing, not subtitle visibility.
+            crate::subtitle_scheduler::DecodedSubtitleEvent::show(
+                stream_id,
+                generation,
+                start,
+                None,
+                WaylandSubtitlePayload::Pgs {
+                    frames,
+                    video_width,
+                    video_height,
+                },
+            )
+        }
+    }
+}
+
 pub struct SubsurfacePipeline {
     speed: f64,
     pub pipeline: Arc<gst::Pipeline>,
@@ -486,6 +517,18 @@ impl SubsurfacePipeline {
         Some((start, end))
     }
 
+    fn running_time_for_duration_timestamp(
+        timestamp: Duration,
+        timing: &Mutex<PadSubtitleTiming>,
+    ) -> Option<Duration> {
+        let nanos = u64::try_from(timestamp.as_nanos()).ok()?;
+        let timestamp = gst::ClockTime::from_nseconds(nanos);
+        timing
+            .lock()
+            .ok()
+            .and_then(|timing| timing.running_time_for(timestamp))
+    }
+
     fn gap_running_time(gap: &gst::event::Gap, timing: &Mutex<PadSubtitleTiming>) -> Duration {
         let (timestamp, _) = gap.get();
         timing
@@ -535,7 +578,8 @@ impl SubsurfacePipeline {
                         ) else {
                             return gst::PadProbeReturn::Ok;
                         };
-                        let Some((start, end)) = Self::buffer_window(buffer, &timing) else {
+                        let Some((start, _buffer_end)) = Self::buffer_window(buffer, &timing)
+                        else {
                             log::debug!("[pgs-probe] Buffer without timestamp; skipping");
                             return gst::PadProbeReturn::Ok;
                         };
@@ -547,21 +591,26 @@ impl SubsurfacePipeline {
                             Ok(decoder) => decoder,
                             Err(_) => return gst::PadProbeReturn::Ok,
                         };
-                        if let Some(frames) = decoder.feed(map.as_slice()) {
-                            let event = if frames.is_empty() {
-                                crate::subtitle_scheduler::DecodedSubtitleEvent::clear(
-                                    stream_id, generation, start,
-                                )
-                            } else {
-                                let payload = WaylandSubtitlePayload::Pgs {
-                                    frames,
-                                    video_width: decoder.video_width,
-                                    video_height: decoder.video_height,
-                                };
-                                crate::subtitle_scheduler::DecodedSubtitleEvent::show(
-                                    stream_id, generation, start, end, payload,
-                                )
-                            };
+                        let display_sets = decoder.feed(map.as_slice());
+                        let video_width = decoder.video_width;
+                        let video_height = decoder.video_height;
+                        for display_set in display_sets {
+                            let display_start = display_set
+                                .pts
+                                .and_then(|pts| Self::running_time_for_duration_timestamp(pts, &timing))
+                                .unwrap_or(start);
+                            log::debug!(
+                                "[pgs-probe] scheduling display set: buffer_start={start:?}, raw_pts={:?}, display_start={display_start:?}",
+                                display_set.pts
+                            );
+                            let event = pgs_display_set_event(
+                                stream_id.clone(),
+                                generation,
+                                display_start,
+                                display_set.action,
+                                video_width,
+                                video_height,
+                            );
                             let _ = subtitle_tx.send(SubtitleProbeEvent::Decoded(event));
                         }
                     }
@@ -585,19 +634,15 @@ impl SubsurfacePipeline {
                                 Self::update_timing_from_segment(&timing, segment, "pgs-probe");
                             }
                         }
-                        gst::EventView::Gap(gap) => {
-                            if let Some((stream_id, generation)) = Self::active_stream_snapshot(
-                                probe_pad,
-                                &pad_stream_id,
-                                &active,
-                                "pgs-probe",
-                            ) {
-                                let at = Self::gap_running_time(gap, &timing);
-                                let event = crate::subtitle_scheduler::DecodedSubtitleEvent::clear(
-                                    stream_id, generation, at,
-                                );
-                                let _ = subtitle_tx.send(SubtitleProbeEvent::Decoded(event));
-                            }
+                        gst::EventView::Gap(_) => {
+                            // PGS visibility is encoded by display sets: non-empty PCS
+                            // compositions show bitmaps and zero-object normal PCS display
+                            // sets clear them. GAP events on sparse PGS pads describe packet
+                            // absence/buffering, not the subtitle's presentation end, and can
+                            // arrive immediately after a bitmap display set.
+                            log::debug!(
+                                "[pgs-probe] Ignoring GAP event; PGS display sets carry clear timing"
+                            );
                         }
                         gst::EventView::FlushStart(_) | gst::EventView::FlushStop(_) => {
                             Self::send_invalidate_for_active_stream(
@@ -931,5 +976,117 @@ impl Drop for SubsurfacePipeline {
         let _ = self.pipeline.state(gst::ClockTime::from_seconds(1));
 
         log::debug!("Cleanup completed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pgs_display_set_event, WaylandSubtitlePayload};
+    use crate::{
+        pgs_decoder::{PgsDisplaySet, PgsFrame},
+        subtitle_scheduler::{DecodedSubtitleEvent, SubtitleAction, SubtitleScheduler},
+    };
+    use std::time::Duration;
+
+    const STREAM: &str = "pgs/en";
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    #[test]
+    fn non_empty_pgs_display_sets_have_no_scheduled_end() {
+        let frames = vec![PgsFrame {
+            argb: vec![0, 0, 0, 255],
+            width: 1,
+            height: 1,
+            x: 10,
+            y: 20,
+        }];
+
+        assert_eq!(
+            pgs_display_set_event(
+                STREAM.to_string(),
+                3,
+                ms(1_000),
+                PgsDisplaySet::Show(frames.clone()),
+                1920,
+                1080
+            ),
+            DecodedSubtitleEvent::show(
+                STREAM,
+                3,
+                ms(1_000),
+                None,
+                WaylandSubtitlePayload::Pgs {
+                    frames,
+                    video_width: 1920,
+                    video_height: 1080,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn empty_pgs_display_sets_clear_at_their_timestamp() {
+        assert_eq!(
+            pgs_display_set_event(
+                STREAM.to_string(),
+                3,
+                ms(2_500),
+                PgsDisplaySet::Clear,
+                1920,
+                1080
+            ),
+            DecodedSubtitleEvent::clear(STREAM, 3, ms(2_500))
+        );
+    }
+
+    #[test]
+    fn open_ended_pgs_cue_persists_until_empty_display_set_clear() {
+        let mut scheduler = SubtitleScheduler::new(STREAM, 3);
+        let payload = WaylandSubtitlePayload::Pgs {
+            frames: vec![PgsFrame {
+                argb: vec![0, 0, 0, 255],
+                width: 1,
+                height: 1,
+                x: 0,
+                y: 0,
+            }],
+            video_width: 1920,
+            video_height: 1080,
+        };
+
+        assert!(scheduler.push_event(DecodedSubtitleEvent::show(
+            STREAM,
+            3,
+            ms(1_000),
+            None,
+            payload.clone(),
+        )));
+        assert_eq!(
+            scheduler.drain_due(ms(1_000)),
+            vec![SubtitleAction::Attach(
+                crate::subtitle_scheduler::SubtitleAttach {
+                    stream_id: STREAM.to_string(),
+                    generation: 3,
+                    start: ms(1_000),
+                    end: None,
+                    payload,
+                }
+            )]
+        );
+        assert!(scheduler.drain_due(ms(2_499)).is_empty());
+
+        assert!(scheduler.push_event(DecodedSubtitleEvent::clear(STREAM, 3, ms(2_500))));
+        assert_eq!(
+            scheduler.drain_due(ms(2_500)),
+            vec![SubtitleAction::Clear(
+                crate::subtitle_scheduler::SubtitleClearAction {
+                    stream_id: STREAM.to_string(),
+                    generation: 3,
+                },
+            )]
+        );
     }
 }
