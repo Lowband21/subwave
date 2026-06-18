@@ -5,13 +5,19 @@ use std::{
 };
 
 use gstreamer::StreamCollection;
+use parking_lot::Mutex as ParkMutex;
 use std::sync::mpsc;
 use subwave_core::{
     types::PendingState,
     video::types::{AudioTrack, SubtitleTrack},
 };
 
-use crate::{pipeline::SubsurfacePipeline, video::Cmd, WaylandSubsurfaceManager};
+use crate::{
+    pipeline::SubsurfacePipeline,
+    subtitle_runtime::{ActiveSubtitleSelection, SubtitleProbeEvent, WaylandSubtitleScheduler},
+    video::Cmd,
+    WaylandSubsurfaceManager,
+};
 
 // Internal encapsulates all state and is only accessed behind the RwLock
 pub(crate) struct Internal {
@@ -42,6 +48,9 @@ pub(crate) struct Internal {
     // Command receiver for bus->UI updates
     pub(crate) cmd_rx: Option<mpsc::Receiver<Cmd>>,
 
+    // Startup readiness: first AsyncDone observed from pipeline
+    pub(crate) startup_async_done: bool,
+
     // Track selection state
     pub(crate) stream_collection: Option<StreamCollection>,
 
@@ -49,6 +58,10 @@ pub(crate) struct Internal {
     pub(crate) available_subtitles: Vec<SubtitleTrack>,
     pub(crate) current_subtitle_track: Option<i32>,
     pub(crate) subtitles_enabled: bool,
+    pub(crate) pgs_stream_ids: Vec<String>,
+    pub(crate) active_subtitle_selection: Arc<ParkMutex<ActiveSubtitleSelection>>,
+    pub(crate) subtitle_event_rx: Option<mpsc::Receiver<SubtitleProbeEvent>>,
+    pub(crate) subtitle_scheduler: Option<WaylandSubtitleScheduler>,
 
     // Audio track tracking
     pub(crate) available_audio_tracks: Vec<AudioTrack>,
