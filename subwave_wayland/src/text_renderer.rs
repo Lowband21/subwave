@@ -86,8 +86,9 @@ impl TextRenderer {
         let font_data = load_font_data()?;
         let font = FontRef::try_from_slice(font_data).ok()?;
 
-        // Strip common HTML-ish subtitle tags (<i>, <b>, <font …>, etc.)
-        let clean = strip_tags(text);
+        // Strip common HTML-ish subtitle tags (<i>, <b>, <font …>, etc.), then
+        // decode character references used by text/x-raw/Pango subtitle payloads.
+        let clean = clean_subtitle_text(text);
         let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.is_empty() {
             return None;
@@ -238,6 +239,13 @@ impl TextRenderer {
     }
 }
 
+/// Normalize subtitle text before layout.
+fn clean_subtitle_text(input: &str) -> String {
+    // Strip tags before decoding entities so escaped literal angle brackets
+    // (e.g. `&lt;not a tag&gt;`) survive as visible text.
+    decode_subtitle_entities(&strip_tags(input))
+}
+
 /// Strip HTML-like tags that SRT/WebVTT subtitle text may contain.
 fn strip_tags(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -252,4 +260,107 @@ fn strip_tags(input: &str) -> String {
         }
     }
     out
+}
+
+/// Decode XML/HTML character references in subtitle text.
+///
+/// GStreamer's `text/x-raw` subtitle path can carry Pango/XML-ish markup where
+/// punctuation and symbols are represented as character references (for example
+/// `&apos;`, `&rsquo;`, `&#39;`, or `&#x2019;`).  Use quick-xml's HTML5 entity table
+/// for named references, plus generic decimal/hex numeric references so the full
+/// Unicode range can be represented without maintaining a hand-written list.
+/// Unknown or malformed references are preserved verbatim instead of causing the
+/// whole subtitle line to remain escaped.
+fn decode_subtitle_entities(input: &str) -> String {
+    if !input.as_bytes().contains(&b'&') {
+        return input.to_owned();
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut pos = 0;
+    while let Some(relative_start) = input[pos..].find('&') {
+        let start = pos + relative_start;
+        out.push_str(&input[pos..start]);
+
+        let entity_start = start + 1;
+        let Some(relative_end) = input[entity_start..].find(';') else {
+            out.push_str(&input[start..]);
+            return out;
+        };
+        let end = entity_start + relative_end;
+        let entity = &input[entity_start..end];
+
+        if push_decoded_subtitle_entity(entity, &mut out) {
+            pos = end + 1;
+        } else {
+            // Preserve the ampersand and continue scanning after it.  This keeps
+            // unknown entities intact while still allowing a later valid entity
+            // on the same line to decode (e.g. `AT&T&apos;s`).
+            out.push('&');
+            pos = entity_start;
+        }
+    }
+
+    out.push_str(&input[pos..]);
+    out
+}
+
+fn push_decoded_subtitle_entity(entity: &str, out: &mut String) -> bool {
+    if let Some(ch) = decode_numeric_subtitle_entity(entity) {
+        out.push(ch);
+        true
+    } else if let Some(value) = quick_xml::escape::resolve_predefined_entity(entity) {
+        out.push_str(value);
+        true
+    } else {
+        false
+    }
+}
+
+fn decode_numeric_subtitle_entity(entity: &str) -> Option<char> {
+    let number = entity.strip_prefix('#')?;
+    let (digits, radix) = number
+        .strip_prefix('x')
+        .or_else(|| number.strip_prefix('X'))
+        .map_or((number, 10), |hex| (hex, 16));
+
+    if digits.is_empty() || matches!(digits.as_bytes().first(), Some(b'+' | b'-')) {
+        return None;
+    }
+
+    let codepoint = u32::from_str_radix(digits, radix).ok()?;
+    (codepoint != 0)
+        .then_some(codepoint)
+        .and_then(char::from_u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_named_and_numeric_subtitle_entities() {
+        assert_eq!(
+            clean_subtitle_text(
+                "It&apos;s &quot;fine&quot; &amp; dandy &#39;&#x2019;&#X2026; &rsquo;"
+            ),
+            "It's \"fine\" & dandy '’… ’"
+        );
+    }
+
+    #[test]
+    fn preserves_unknown_or_malformed_entities_while_decoding_later_valid_ones() {
+        assert_eq!(
+            clean_subtitle_text("AT&T&apos;s &madeup; &unfinished"),
+            "AT&T's &madeup; &unfinished"
+        );
+    }
+
+    #[test]
+    fn strips_tags_before_decoding_escaped_angle_brackets() {
+        assert_eq!(
+            clean_subtitle_text("<i>&lt;literal&gt; &apos;quoted&apos;</i>"),
+            "<literal> 'quoted'"
+        );
+    }
 }

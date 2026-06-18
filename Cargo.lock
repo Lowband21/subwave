@@ -3359,6 +3359,7 @@ dependencies = [
  "log",
  "once_cell",
  "parking_lot",
+ "quick-xml",
  "raw-window-handle",
  "rustc-hash 2.1.1",
  "subwave_core",
