@@ -20,6 +20,8 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
+use crate::color_management::ColorManager;
+
 /// Manages a Wayland subsurface for video rendering
 pub struct WaylandSubsurfaceManager {
     /// The Wayland connection (shared with parent)
@@ -85,6 +87,11 @@ pub struct WaylandSubsurfaceManager {
     subtitle_pool: Mutex<Option<WlShmPool>>,
     subtitle_file: Mutex<Option<std::fs::File>>,
     subtitle_pool_dims: Mutex<Option<(i32, i32, i32)>>, // (w,h,stride)
+
+    /// Color management (wp-color-management-v1) for per-surface HDR/SDR tagging.
+    /// When available, the video surface is tagged BT.2020+PQ and the subtitle
+    /// surface is tagged sRGB, so the compositor can tone-map each independently.
+    color_manager: Mutex<Option<ColorManager>>,
 }
 
 impl std::fmt::Debug for WaylandSubsurfaceManager {
@@ -102,14 +109,19 @@ impl std::fmt::Debug for WaylandSubsurfaceManager {
 }
 
 /// State for Wayland event dispatching
-struct State {
-    globals: Vec<(u32, String, u32)>, // (name, interface, version)
+pub(crate) struct State {
+    pub(crate) globals: Vec<(u32, String, u32)>, // (name, interface, version)
+    /// Color management feature flags (populated by wp_color_manager_v1 events)
+    pub(crate) cm_supports_set_luminances: bool,
+    pub(crate) cm_supports_set_mastering_primaries: bool,
 }
 
 impl State {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             globals: Vec::new(),
+            cm_supports_set_luminances: false,
+            cm_supports_set_mastering_primaries: false,
         }
     }
 }
@@ -192,6 +204,27 @@ impl WaylandSubsurfaceManager {
                 log::error!("No wl_shm found - black background buffer will not be available");
                 None
             };
+
+            // ── Color management (optional) ──────────────────────────────
+            // We only bind the global here.  Actual image descriptions are
+            // created lazily when the video caps indicate HDR content (see
+            // `notify_video_colorimetry`).  The subtitle surface is
+            // deliberately left untagged so the compositor defaults to sRGB.
+            let mut color_manager = ColorManager::bind_if_available(&state.globals, &registry, &qh);
+            if let Some(ref mut cm) = color_manager {
+                // Roundtrip to receive the capability events (supported TFs, features, etc.)
+                event_queue.roundtrip(&mut state).map_err(|e| {
+                    Error::Wayland(format!("Failed to roundtrip for color-mgmt: {}", e))
+                })?;
+                // Transfer the feature flags that the Dispatch handler stored in State
+                cm.supports_set_luminances = state.cm_supports_set_luminances;
+                cm.supports_set_mastering_primaries = state.cm_supports_set_mastering_primaries;
+                log::info!(
+                    "[color-mgmt] Feature flags: luminances={}, mastering_primaries={}",
+                    cm.supports_set_luminances,
+                    cm.supports_set_mastering_primaries,
+                );
+            }
 
             // Create a proxy for the parent surface without taking ownership
             // The parent surface is already managed by winit/iced
@@ -286,16 +319,21 @@ impl WaylandSubsurfaceManager {
                 subcompositor.get_subsurface(&subtitle_surface, &parent_surface, &qh, ());
             log::debug!("Created subtitle subsurface");
 
-            // Set to desynchronized mode for independent video and subtitle updates
+            // Video subsurface: desync so GStreamer's waylandsink can commit
+            // frames independently on its streaming thread.
             video_subsurface.set_desync();
-            subtitle_subsurface.set_desync();
-            log::debug!(
-                "Set video and subtitle subsurfaces to desync mode for independent updates"
-            );
 
-            // Background surface can be synchronized with parent since it only needs to change on resize
+            // Subtitle subsurface: SYNC mode.  Changes are applied atomically
+            // when the parent surface (iced) commits.  This prevents the green
+            // flash on Hyprland's HDR CM pipeline — desync subtitle commits
+            // cause the compositor to re-composite asynchronously, triggering
+            // a transient color-management rendering glitch.  mpv uses the
+            // same approach: all surfaces are committed together.
+            subtitle_subsurface.set_sync();
+
+            // Background: sync with parent (only changes on resize).
             background_subsurface.set_sync();
-            log::debug!("Set background subsurface to sync mode");
+            log::debug!("Subsurface modes: video=desync, subtitle=sync, background=sync");
 
             // Z-ordering: video below parent, subtitle above parent
             video_subsurface.place_below(&parent_surface);
@@ -350,6 +388,7 @@ impl WaylandSubsurfaceManager {
                 subtitle_pool: Mutex::new(None),
                 subtitle_file: Mutex::new(None),
                 subtitle_pool_dims: Mutex::new(None),
+                color_manager: Mutex::new(color_manager),
             });
 
             // Create initial background buffer
@@ -476,7 +515,20 @@ impl WaylandSubsurfaceManager {
         if self.shm.is_none() {
             return Err(Error::Wayland("No wl_shm for subtitle".into()));
         }
+        if width <= 0 || height <= 0 || stride <= 0 {
+            return Ok(()); // degenerate frame, skip
+        }
         let needed = (stride as usize) * (height as usize);
+        if data.len() < needed {
+            return Err(Error::Wayland(format!(
+                "Subtitle data too small: {} < {} ({}x{} stride={})",
+                data.len(),
+                needed,
+                width,
+                height,
+                stride
+            )));
+        }
         log::debug!(
             "[subs] attach_subtitle_frame called: {}x{} stride={} ({} bytes)",
             width,
@@ -737,6 +789,68 @@ impl WaylandSubsurfaceManager {
         handle
     }
 
+    /// Returns `true` if the compositor supports `wp-color-management-v1`.
+    pub fn has_color_management(&self) -> bool {
+        self.color_manager.lock().is_some()
+    }
+
+    /// Returns `true` if the video surface is currently tagged with an HDR
+    /// image description.  When true, the compositor tone-maps the subtitle
+    /// surface (sRGB by default) independently of the HDR video surface.
+    pub fn is_video_tagged_hdr(&self) -> bool {
+        self.color_manager
+            .lock()
+            .as_ref()
+            .is_some_and(|cm| cm.is_video_tagged_hdr())
+    }
+
+    /// Notify the subsurface manager of the current video stream's colorimetry.
+    ///
+    /// When the video is HDR (PQ/HLG transfer) and the compositor supports
+    /// color management, this tags the video surface with a BT.2020+PQ image
+    /// description.  When the video is SDR, any HDR tag is removed so the
+    /// compositor treats the video surface as sRGB.
+    ///
+    /// `colorimetry` is the GStreamer colorimetry string (e.g. `"0:0:14:7"`).
+    /// `metadata` contains optional mastering display / content light level info.
+    ///
+    /// This is safe to call on every caps change — it no-ops if the colorimetry
+    /// hasn't changed.
+    pub fn notify_video_colorimetry(
+        &self,
+        colorimetry: &str,
+        metadata: Option<&crate::color_management::HdrMetadata>,
+    ) {
+        let mut cm_lock = self.color_manager.lock();
+        let Some(ref mut cm) = *cm_lock else {
+            return; // no color management support
+        };
+
+        let is_hdr = crate::color_management::HdrMetadata::is_hdr_colorimetry(colorimetry);
+
+        if is_hdr {
+            // Take a single lock on the event queue for both the handle and the roundtrip
+            let mut eq = self.event_queue.lock();
+            let qh = eq.handle();
+            match cm.tag_video_hdr(colorimetry, metadata, &self.video_surface, &qh, &mut eq) {
+                Ok(()) => {
+                    drop(eq);
+                    if let Err(e) = self.flush() {
+                        log::warn!("[color-mgmt] Flush after HDR tag failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[color-mgmt] Failed to tag video HDR (non-fatal): {e}");
+                }
+            }
+        } else {
+            cm.untag_video(&self.video_surface);
+            if let Err(e) = self.flush() {
+                log::warn!("[color-mgmt] Flush after untag failed: {e}");
+            }
+        }
+    }
+
     /// Flush any pending Wayland events
     pub fn flush(&self) -> Result<()> {
         self.event_queue
@@ -916,6 +1030,11 @@ impl Drop for WaylandSubsurfaceManager {
             pool.destroy();
         }
         self.subtitle_file.lock().take();
+
+        // Destroy color management resources before surfaces
+        if let Some(mut cm) = self.color_manager.lock().take() {
+            cm.destroy();
+        }
 
         // Destroy viewports if they exist
         if let Some(ref viewport) = self.video_viewport {
