@@ -13,7 +13,7 @@ pub fn build_http_headers_context<T: AsRef<str>, U: AsRef<str>>(
     {
         let s = ctx.get_mut().unwrap().structure_mut();
         for (k, v) in headers.iter() {
-            s.set(k.as_ref(), &v.as_ref());
+            s.set(k.as_ref(), v.as_ref());
         }
     }
     Some(ctx)
