@@ -32,7 +32,6 @@ categories = ["multimedia"]
 iced = { git = "https://github.com/Lowband21/iced-ferrex.git", default-features = false, features = [
   "advanced",
   "wgpu",
-  "image",
   "thread-pool",
   "wayland-hack",
   "wayland",
