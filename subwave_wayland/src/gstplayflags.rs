@@ -140,15 +140,18 @@ pub mod gst_play_flags {
         }
 
         pub fn wayland_native() -> Self {
-            // Wayland path renders subtitles via subwave_overlay, so we keep
-            // playbin's text handling disabled to avoid autoplugging CPU paths.
+            // Subtitle rendering is handled entirely out-of-band via
+            // demuxer pad probes (PGS bitmap and text/x-raw).  We omit
+            // TEXT so playbin3 never activates subtitleoverlay, which
+            // would interfere with HDR passthrough on the video chain.
+            // NATIVE_VIDEO is safe because subtitleoverlay is never
+            // involved.
             Self::VIDEO
                 | Self::AUDIO
-                | Self::TEXT
+                | Self::NATIVE_VIDEO
                 | Self::SOFT_VOLUME
                 | Self::BUFFERING
                 | Self::DEINTERLACE
-                | Self::NATIVE_VIDEO
         }
 
         pub fn network_no_subs() -> Self {
