@@ -304,9 +304,8 @@ impl SubwaveVideo {
 
     /// Provide HTTP headers to be used by HTTP-based sources within the pipeline.
     ///
-    /// This sets a GStreamer "http-headers" context on the underlying pipeline when available.
-    /// For the Wayland backend where the pipeline is lazily created, headers are stored and
-    /// applied once the pipeline is initialized.
+    /// Headers are applied to HTTP sources created by the underlying playback pipeline.
+    /// The Wayland backend retains them until its pipeline is initialized.
     pub fn set_http_headers(&mut self, headers: &[(impl AsRef<str>, impl AsRef<str>)]) {
         match self {
             SubwaveVideo::Appsink { inner, .. } => {

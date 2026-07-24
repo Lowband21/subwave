@@ -38,7 +38,7 @@ impl AppsinkVideo {
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;
 
-        // Apply http-headers context before any state transitions
+        // Install HTTP source hooks before any state transitions.
         if let Some(h) = headers {
             subwave_core::http::set_http_headers_on_pipeline(&pipeline, h);
         }
@@ -452,9 +452,7 @@ impl AppsinkVideo {
         self.0.get_mut().expect("lock")
     }
 
-    /// Set HTTP headers for HTTP-based sources via GStreamer "http-headers" context.
-    /// Applies the context to the underlying pipeline so that HTTP elements (e.g. souphttpsrc,
-    /// adaptivedemux segment fetchers) can use them for requests.
+    /// Set request headers on HTTP sources created by the playback pipeline.
     pub fn set_http_headers(&mut self, headers: &[(impl AsRef<str>, impl AsRef<str>)]) {
         let pipeline = self.get_mut().source.clone();
         subwave_core::http::set_http_headers_on_pipeline(&pipeline, headers);
@@ -479,9 +477,6 @@ impl Video for AppsinkVideo {
         (props.width, props.height)
     }
 
-    /// Set HTTP headers for HTTP-based sources via GStreamer "http-headers" context.
-    /// Applies the context to the underlying pipeline so that HTTP elements (e.g. souphttpsrc,
-    /// adaptivedemux segment fetchers) can use them for requests.
     /// Get the framerate of the video as frames per second.
     fn framerate(&self) -> f64 {
         let inner = self.read();
