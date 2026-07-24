@@ -69,14 +69,17 @@ pub struct WaylandSubsurfaceManager {
     /// Current size
     size: Arc<Mutex<(i32, i32)>>,
 
-    /// The size of the renderable area we provide gstreamer
-    source_size: Arc<Mutex<(i32, i32, i32, i32)>>,
-
     /// Flag indicating we need to update on next parent commit
     needs_update: Arc<AtomicBool>,
 
-    /// Shared memory object for creating black buffer
+    /// Shared memory object for creating surface buffers
     shm: Option<WlShm>,
+
+    /// Transparent buffer that keeps the intermediary GStreamer host surface mapped.
+    /// `waylandsink` creates its own subsurfaces beneath this surface, so Wayland
+    /// requires this ancestor to have a non-null buffer before video can be visible.
+    video_anchor_buffer: WlBuffer,
+    video_anchor_pool: WlShmPool,
 
     /// Background buffer (black rectangle)
     background_buffer: Mutex<Option<WlBuffer>>,
@@ -124,6 +127,40 @@ impl State {
             cm_supports_set_mastering_primaries: false,
         }
     }
+}
+
+const VIDEO_ANCHOR_WIDTH: i32 = 1;
+const VIDEO_ANCHOR_HEIGHT: i32 = 1;
+const VIDEO_ANCHOR_STRIDE: i32 = VIDEO_ANCHOR_WIDTH * 4;
+const VIDEO_ANCHOR_SIZE: usize = (VIDEO_ANCHOR_STRIDE * VIDEO_ANCHOR_HEIGHT) as usize;
+const INITIAL_VIDEO_WIDTH: i32 = 1280;
+const INITIAL_VIDEO_HEIGHT: i32 = 720;
+
+fn create_transparent_video_anchor(
+    shm: &WlShm,
+    qh: &QueueHandle<State>,
+) -> Result<(WlBuffer, WlShmPool)> {
+    let mut file = tempfile()
+        .map_err(|e| Error::Wayland(format!("Failed to create video anchor tempfile: {e}")))?;
+    file.set_len(VIDEO_ANCHOR_SIZE as u64)
+        .map_err(|e| Error::Wayland(format!("Failed to resize video anchor tempfile: {e}")))?;
+
+    // wl_shm ARGB8888 is premultiplied; zero alpha makes this pixel fully transparent.
+    file.write_all(&[0; VIDEO_ANCHOR_SIZE])
+        .map_err(|e| Error::Wayland(format!("Failed to write video anchor buffer: {e}")))?;
+
+    let pool = shm.create_pool(file.as_fd(), VIDEO_ANCHOR_SIZE as i32, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        VIDEO_ANCHOR_WIDTH,
+        VIDEO_ANCHOR_HEIGHT,
+        VIDEO_ANCHOR_STRIDE,
+        Format::Argb8888,
+        qh,
+        (),
+    );
+
+    Ok((buffer, pool))
 }
 
 impl WaylandSubsurfaceManager {
@@ -191,18 +228,19 @@ impl WaylandSubsurfaceManager {
                 None
             };
 
-            // Shm buffer for background data
+            // Shared memory for the transparent video anchor, background, and subtitles.
             let shm = if let Some(shm_global) = state
                 .globals
                 .iter()
                 .find(|(_, interface, _)| interface == "wl_shm")
             {
                 let shm: WlShm = registry.bind(shm_global.0, shm_global.2.min(1), &qh, ());
-                log::debug!("Found and bound wl_shm for black background buffer");
-                Some(shm)
+                log::debug!("Found and bound wl_shm for surface buffers");
+                shm
             } else {
-                log::error!("No wl_shm found - black background buffer will not be available");
-                None
+                return Err(Error::Wayland(
+                    "No wl_shm found; cannot map the GStreamer video host surface".into(),
+                ));
             };
 
             // ── Color management (optional) ──────────────────────────────
@@ -343,17 +381,28 @@ impl WaylandSubsurfaceManager {
 
             background_subsurface.place_below(&video_surface);
 
-            // Commit children so compositor can pick up reordering right away
+            // `waylandsink` treats the supplied surface as a parent and renders into
+            // nested subsurfaces. Wayland hides the entire subtree until every
+            // subsurface ancestor is mapped, so retain a transparent buffer here.
+            let (video_anchor_buffer, video_anchor_pool) =
+                create_transparent_video_anchor(&shm, &qh)?;
+            if let Some(ref viewport) = video_viewport {
+                // Scale the transparent anchor without setting a source rectangle.
+                // GStreamer owns source cropping on its nested video surface.
+                viewport.set_destination(INITIAL_VIDEO_WIDTH, INITIAL_VIDEO_HEIGHT);
+            }
+            video_surface.attach(Some(&video_anchor_buffer), 0, 0);
+            video_surface.damage_buffer(0, 0, VIDEO_ANCHOR_WIDTH, VIDEO_ANCHOR_HEIGHT);
+            log::debug!("Mapped GStreamer video host with transparent 1x1 anchor buffer");
+
+            // Commit children so the compositor can pick up the roles, ordering,
+            // and video host mapping on the next parent commit.
             background_surface.commit();
             video_surface.commit();
             subtitle_surface.commit();
 
-            // Both subsurface default position is (0, 0) in the top-left corner of the parent surface,
-            // only reason to modify is PIP support
-
-            background_surface.commit();
-            video_surface.commit();
-            subtitle_surface.commit();
+            // All subsurfaces default to (0, 0) relative to the parent. Position
+            // updates are only needed for layout changes or picture-in-picture.
 
             // Roundtrip to ensure subsurfaces are properly registered
             event_queue.roundtrip(&mut state).map_err(|e| {
@@ -379,9 +428,10 @@ impl WaylandSubsurfaceManager {
                 subtitle_viewport,
                 position: Arc::new(Mutex::new((0, 0))),
                 size: Arc::new(Mutex::new((0, 0))),
-                source_size: Arc::new(Mutex::new((0, 0, 0, 0))),
                 needs_update: Arc::new(AtomicBool::new(false)),
-                shm,
+                shm: Some(shm),
+                video_anchor_buffer,
+                video_anchor_pool,
                 background_buffer: Mutex::new(None),
                 background_pool: Mutex::new(None),
                 subtitle_buffer: Mutex::new(None),
@@ -418,7 +468,6 @@ impl WaylandSubsurfaceManager {
             let needs_update_weak = Arc::downgrade(&subsurface_manager.needs_update);
             let position_weak = Arc::downgrade(&subsurface_manager.position);
             let size_weak = Arc::downgrade(&subsurface_manager.size);
-            let source_size_weak = Arc::downgrade(&subsurface_manager.source_size);
             let subsurface_clone = subsurface_manager.video_subsurface.clone();
             let video_surface_clone = subsurface_manager.video_surface.clone();
             let viewport_clone = subsurface_manager.video_viewport.clone();
@@ -431,13 +480,12 @@ impl WaylandSubsurfaceManager {
 
             integration.register_pre_commit_hook(move || {
                 // Check weak references and bail early if they're gone
-                let (needs_update, position, size, source_size) = match (
+                let (needs_update, position, size) = match (
                     needs_update_weak.upgrade(),
                     position_weak.upgrade(),
                     size_weak.upgrade(),
-                    source_size_weak.upgrade(),
                 ) {
-                    (Some(n), Some(p), Some(s), Some(src)) => (n, p, s, src),
+                    (Some(n), Some(p), Some(s)) => (n, p, s),
                     _ => return, // Subsurface has been dropped, nothing to do
                 };
 
@@ -445,57 +493,52 @@ impl WaylandSubsurfaceManager {
                     let (x, y) = *position.lock();
                     let (dest_w, dest_h) = *size.lock();
 
-                    // Update video subsurface position
+                    // Position changes take effect with the imminent parent commit.
                     subsurface_clone.set_position(x, y);
-
-                    // Update background subsurface position and size
                     background_subsurface_clone.set_position(x, y);
+                    subtitle_subsurface_clone.set_position(x, y);
+
+                    if dest_w <= 0 || dest_h <= 0 {
+                        log::debug!(
+                            "Skipping non-positive subsurface viewport size {}x{}",
+                            dest_w,
+                            dest_h
+                        );
+                        return;
+                    }
+
                     if let Some(ref bg_viewport) = background_viewport_clone {
                         bg_viewport.set_destination(dest_w, dest_h);
-                        log::debug!("Background viewport updated to {}x{}", dest_w, dest_h);
                         background_surface_clone.damage(0, 0, dest_w, dest_h);
-                        log::debug!(
-                            "Background committed at ({},{}) size {}x{}",
-                            x,
-                            y,
-                            dest_w,
-                            dest_h
-                        );
+                        background_surface_clone.commit();
+                        log::debug!("Background viewport updated to {}x{}", dest_w, dest_h);
                     } else {
-                        log::error!("Error: No background viewport in pre-commit hook!");
+                        log::error!("No background viewport in pre-commit hook");
                     }
 
-                    // Update subtitle subsurface position to match video
-                    subtitle_subsurface_clone.set_position(x, y);
                     if let Some(ref sub_viewport) = subtitle_viewport_clone {
                         sub_viewport.set_destination(dest_w, dest_h);
-                        log::debug!("Background viewport updated to {}x{}", dest_w, dest_h);
                         subtitle_surface_clone.damage(0, 0, dest_w, dest_h);
-                        log::debug!(
-                            "Background committed at ({},{}) size {}x{}",
-                            x,
-                            y,
-                            dest_w,
-                            dest_h
-                        );
+                        subtitle_surface_clone.commit();
+                        log::debug!("Subtitle viewport updated to {}x{}", dest_w, dest_h);
                     } else {
-                        log::error!("Error: No subtitle viewport in pre-commit hook!");
+                        log::error!("No subtitle viewport in pre-commit hook");
                     }
 
-                    log::debug!("[subs] Subtitle subsurface positioned at ({}, {})", x, y);
-
-                    // Update video viewport (if present); otherwise skip to avoid complications
-                    if let Some(ref vp) = viewport_clone {
-                        vp.set_destination(dest_w, dest_h);
-                        log::debug!("Updated dest to {}x{}", dest_w, dest_h);
-                        let (x, y, w, h) = *source_size.lock();
-                        vp.set_source(
-                            f64::from(x.max(1)),
-                            f64::from(y.max(1)),
-                            f64::from(w.max(1)),
-                            f64::from(h.max(1)),
+                    // Only scale the transparent host buffer. GStreamer manages the
+                    // source rectangle and video scaling on its nested surfaces.
+                    if let Some(ref viewport) = viewport_clone {
+                        viewport.set_destination(dest_w, dest_h);
+                        video_surface_clone.damage_buffer(
+                            0,
+                            0,
+                            VIDEO_ANCHOR_WIDTH,
+                            VIDEO_ANCHOR_HEIGHT,
                         );
-                        video_surface_clone.damage(0, 0, dest_w, dest_h);
+                        video_surface_clone.commit();
+                        log::debug!("Video host viewport updated to {}x{}", dest_w, dest_h);
+                    } else {
+                        log::error!("No video viewport in pre-commit hook");
                     }
                 }
             });
@@ -688,17 +731,7 @@ impl WaylandSubsurfaceManager {
     pub fn set_size(&self, w: i32, h: i32) {
         log::info!("[subs] WaylandSubsurfaceManager::set_size -> {}x{}", w, h);
         *self.size.lock() = (w, h);
-
         self.needs_update.store(true, Ordering::Relaxed);
-        self.video_surface.commit();
-        self.subtitle_surface.commit();
-    }
-
-    pub fn set_source_size(&self, (x, y, w, h): (i32, i32, i32, i32)) {
-        *self.source_size.lock() = (x, y, w, h);
-
-        self.needs_update.store(true, Ordering::Relaxed);
-        self.video_surface.commit();
     }
 
     /// Get the current position
@@ -711,11 +744,6 @@ impl WaylandSubsurfaceManager {
         *self.size.lock()
     }
 
-    /// Get the current source size
-    pub fn get_source_size(&self) -> (i32, i32, i32, i32) {
-        *self.source_size.lock()
-    }
-
     // Do we have use for this function?
     pub fn set_buffer_offset(&self, x: i32, y: i32) {
         self.video_surface.offset(x, y);
@@ -726,36 +754,35 @@ impl WaylandSubsurfaceManager {
         log::debug!("Buffer offset changed to {}x{}, surface committed", x, y,);
     }
 
-    /// Set video viewport with source and destination rectangles for ContentFit mapping
-    /// source: Optional source rectangle (x, y, width, height) in wl_fixed coordinates
-    /// dest: Destination size (width, height) in surface coordinates
+    /// Set the destination size of the intermediary video host surface.
+    ///
+    /// `source` is retained for API compatibility but intentionally ignored:
+    /// GStreamer's nested Wayland surfaces own video cropping and scaling.
     pub fn set_video_viewport(
         &self,
         source: Option<(i32, i32, i32, i32)>,
         dest: Option<(i32, i32)>,
     ) {
+        if source.is_some() {
+            log::debug!("Ignoring host viewport source; GStreamer owns video source cropping");
+        }
+
+        let Some((width, height)) = dest else {
+            return;
+        };
+        if width <= 0 || height <= 0 {
+            log::warn!("Ignoring non-positive video viewport {width}x{height}");
+            return;
+        }
+
         if let Some(ref viewport) = self.video_viewport {
-            // Set source rectangle if provided (for cropping/scaling)
-            if let Some((x, y, w, h)) = source {
-                viewport.set_source(f64::from(x), f64::from(y), f64::from(w), f64::from(h));
-                log::debug!(
-                    "Viewport source set to ({:.2}, {:.2}, {:.2}, {:.2})",
-                    x,
-                    y,
-                    w,
-                    h
-                );
-            }
-
-            if let Some((x, y)) = dest {
-                // Set destination size (surface size)
-                viewport.set_destination(x, y);
-                log::debug!("Viewport destination set to {}x{}", x, y);
-            }
-
+            viewport.set_destination(width, height);
+            self.video_surface
+                .damage_buffer(0, 0, VIDEO_ANCHOR_WIDTH, VIDEO_ANCHOR_HEIGHT);
             self.video_surface.commit();
+            log::debug!("Video host viewport destination set to {width}x{height}");
         } else {
-            log::error!("No viewport available");
+            log::error!("No video viewport available");
         }
     }
 
@@ -1017,6 +1044,8 @@ impl Drop for WaylandSubsurfaceManager {
         }
 
         // Clean up buffers and pools
+        self.video_anchor_buffer.destroy();
+        self.video_anchor_pool.destroy();
         if let Some(buffer) = self.background_buffer.lock().take() {
             buffer.destroy();
         }
