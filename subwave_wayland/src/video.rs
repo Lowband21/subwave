@@ -364,8 +364,8 @@ impl SubsurfaceVideo {
         Ok(SubsurfaceVideo(RwLock::new(inner)))
     }
 
-    /// Set HTTP headers for HTTP-based sources via GStreamer "http-headers" context.
-    /// If the pipeline is not yet initialized, headers are stored and applied during init.
+    /// Set request headers on HTTP sources created by the playback pipeline.
+    /// Headers are retained until the lazy Wayland pipeline is initialized.
     pub fn set_http_headers(&mut self, headers: &[(impl AsRef<str>, impl AsRef<str>)]) {
         // Stash a copy for later application
         {
@@ -411,7 +411,7 @@ impl SubsurfaceVideo {
             subtitle_tx,
         )?);
 
-        // Apply any pending HTTP headers context before starting message processing
+        // Install pending HTTP source hooks before starting message processing.
         if let Some(h) = self.0.read().pending_http_headers.clone() {
             subwave_core::http::set_http_headers_on_pipeline(&pipeline.pipeline, h.as_slice());
         }
