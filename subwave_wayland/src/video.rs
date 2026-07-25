@@ -697,10 +697,11 @@ impl SubsurfaceVideo {
                                 }
                                 MessageView::StateChanged(_state_changed) => {}
                                 MessageView::AsyncDone(_) => {
-                                    // ── Detect HDR and update color management ──
+                                    // ── Observe negotiated video colorimetry ──
                                     // After a state transition completes (PAUSED→PLAYING,
-                                    // or after a seek) the caps are settled. Query vsink
-                                    // for colorimetry and notify the subsurface manager.
+                                    // or after a seek) the caps are settled. This remains
+                                    // diagnostic only: waylandsink tags its nested content
+                                    // surface, while Subwave's mapping anchor stays untagged.
                                     if let Some(vsink) = gst_pipeline.by_name("vsink") {
                                         if let Some(pad) = vsink.static_pad("sink") {
                                             if let Some(caps) = pad.current_caps() {
@@ -744,10 +745,9 @@ impl SubsurfaceVideo {
                                                             }
                                                         }
 
-                                                        // Only tag as HDR if the pixel format can actually
-                                                        // carry HDR data. If vapostproc already tone-mapped
-                                                        // to BGRx/8-bit, the pixels are SDR even if
-                                                        // colorimetry metadata says PQ.
+                                                        // Track whether negotiated pixels still carry HDR.
+                                                        // `notify_video_colorimetry` deliberately never applies
+                                                        // this child metadata to Subwave's mapping anchor.
                                                         let format_ok = crate::color_management::HdrMetadata::is_hdr_capable_format(&pixel_format);
 
                                                         let tx_cm = tx.clone();

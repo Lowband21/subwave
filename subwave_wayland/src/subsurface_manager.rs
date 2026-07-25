@@ -54,9 +54,6 @@ pub struct WaylandSubsurfaceManager {
     /// Subtitle surface
     subtitle_surface: WlSurface,
 
-    /// Viewport for controlling surface size independently of buffer size
-    video_viewport: Option<WpViewport>,
-
     /// Viewport for background surface
     background_viewport: Option<WpViewport>,
 
@@ -91,9 +88,10 @@ pub struct WaylandSubsurfaceManager {
     subtitle_file: Mutex<Option<std::fs::File>>,
     subtitle_pool_dims: Mutex<Option<(i32, i32, i32)>>, // (w,h,stride)
 
-    /// Color management (wp-color-management-v1) for per-surface HDR/SDR tagging.
-    /// When available, the video surface is tagged BT.2020+PQ and the subtitle
-    /// surface is tagged sRGB, so the compositor can tone-map each independently.
+    /// Compositor color-management capability handle.
+    ///
+    /// The transparent host and subtitle surfaces deliberately remain untagged;
+    /// GStreamer's `waylandsink` tags its nested video-content surface directly.
     color_manager: Mutex<Option<ColorManager>>,
 }
 
@@ -114,17 +112,12 @@ impl std::fmt::Debug for WaylandSubsurfaceManager {
 /// State for Wayland event dispatching
 pub(crate) struct State {
     pub(crate) globals: Vec<(u32, String, u32)>, // (name, interface, version)
-    /// Color management feature flags (populated by wp_color_manager_v1 events)
-    pub(crate) cm_supports_set_luminances: bool,
-    pub(crate) cm_supports_set_mastering_primaries: bool,
 }
 
 impl State {
     pub(crate) fn new() -> Self {
         Self {
             globals: Vec::new(),
-            cm_supports_set_luminances: false,
-            cm_supports_set_mastering_primaries: false,
         }
     }
 }
@@ -133,8 +126,6 @@ const VIDEO_ANCHOR_WIDTH: i32 = 1;
 const VIDEO_ANCHOR_HEIGHT: i32 = 1;
 const VIDEO_ANCHOR_STRIDE: i32 = VIDEO_ANCHOR_WIDTH * 4;
 const VIDEO_ANCHOR_SIZE: usize = (VIDEO_ANCHOR_STRIDE * VIDEO_ANCHOR_HEIGHT) as usize;
-const INITIAL_VIDEO_WIDTH: i32 = 1280;
-const INITIAL_VIDEO_HEIGHT: i32 = 720;
 
 fn create_transparent_video_anchor(
     shm: &WlShm,
@@ -244,24 +235,14 @@ impl WaylandSubsurfaceManager {
             };
 
             // ── Color management (optional) ──────────────────────────────
-            // We only bind the global here.  Actual image descriptions are
-            // created lazily when the video caps indicate HDR content (see
-            // `notify_video_colorimetry`).  The subtitle surface is
-            // deliberately left untagged so the compositor defaults to sRGB.
-            let mut color_manager = ColorManager::bind_if_available(&state.globals, &registry, &qh);
-            if let Some(ref mut cm) = color_manager {
-                // Roundtrip to receive the capability events (supported TFs, features, etc.)
+            // Bind only to detect compositor support. The surface passed to
+            // `waylandsink` is a transparent mapping ancestor, not video content,
+            // so it must remain untagged. GStreamer tags its nested video surface.
+            let color_manager = ColorManager::bind_if_available(&state.globals, &registry, &qh);
+            if color_manager.is_some() {
                 event_queue.roundtrip(&mut state).map_err(|e| {
-                    Error::Wayland(format!("Failed to roundtrip for color-mgmt: {}", e))
+                    Error::Wayland(format!("Failed to roundtrip for color-mgmt: {e}"))
                 })?;
-                // Transfer the feature flags that the Dispatch handler stored in State
-                cm.supports_set_luminances = state.cm_supports_set_luminances;
-                cm.supports_set_mastering_primaries = state.cm_supports_set_mastering_primaries;
-                log::info!(
-                    "[color-mgmt] Feature flags: luminances={}, mastering_primaries={}",
-                    cm.supports_set_luminances,
-                    cm.supports_set_mastering_primaries,
-                );
             }
 
             // Create a proxy for the parent surface without taking ownership
@@ -326,14 +307,6 @@ impl WaylandSubsurfaceManager {
                 None
             };
 
-            let video_viewport = if let Some(ref viewporter) = viewporter {
-                let viewport = viewporter.get_viewport(&video_surface, &qh, ());
-                log::debug!("Created viewport for video surface");
-                Some(viewport)
-            } else {
-                None
-            };
-
             let subtitle_viewport = if let Some(ref viewporter) = viewporter {
                 let viewport = viewporter.get_viewport(&subtitle_surface, &qh, ());
                 log::debug!("Created viewport for subtitle surface");
@@ -386,14 +359,14 @@ impl WaylandSubsurfaceManager {
             // subsurface ancestor is mapped, so retain a transparent buffer here.
             let (video_anchor_buffer, video_anchor_pool) =
                 create_transparent_video_anchor(&shm, &qh)?;
-            if let Some(ref viewport) = video_viewport {
-                // Scale the transparent anchor without setting a source rectangle.
-                // GStreamer owns source cropping on its nested video surface.
-                viewport.set_destination(INITIAL_VIDEO_WIDTH, INITIAL_VIDEO_HEIGHT);
-            }
             video_surface.attach(Some(&video_anchor_buffer), 0, 0);
             video_surface.damage_buffer(0, 0, VIDEO_ANCHOR_WIDTH, VIDEO_ANCHOR_HEIGHT);
-            log::debug!("Mapped GStreamer video host with transparent 1x1 anchor buffer");
+            log::debug!(
+                "Mapped GStreamer video host with an untagged transparent 1x1 anchor buffer"
+            );
+            // Keep the anchor at 1x1: subsurfaces are not clipped to their parent,
+            // so GStreamer's nested surfaces can cover the full render rectangle
+            // without turning this inert mapping buffer into a full-screen layer.
 
             // Commit children so the compositor can pick up the roles, ordering,
             // and video host mapping on the next parent commit.
@@ -423,7 +396,6 @@ impl WaylandSubsurfaceManager {
                 background_surface,
                 subtitle_subsurface,
                 subtitle_surface,
-                video_viewport,
                 background_viewport,
                 subtitle_viewport,
                 position: Arc::new(Mutex::new((0, 0))),
@@ -469,8 +441,6 @@ impl WaylandSubsurfaceManager {
             let position_weak = Arc::downgrade(&subsurface_manager.position);
             let size_weak = Arc::downgrade(&subsurface_manager.size);
             let subsurface_clone = subsurface_manager.video_subsurface.clone();
-            let video_surface_clone = subsurface_manager.video_surface.clone();
-            let viewport_clone = subsurface_manager.video_viewport.clone();
             let background_subsurface_clone = subsurface_manager.background_subsurface.clone();
             let background_surface_clone = subsurface_manager.background_surface.clone();
             let background_viewport_clone = subsurface_manager.background_viewport.clone();
@@ -525,21 +495,8 @@ impl WaylandSubsurfaceManager {
                         log::error!("No subtitle viewport in pre-commit hook");
                     }
 
-                    // Only scale the transparent host buffer. GStreamer manages the
-                    // source rectangle and video scaling on its nested surfaces.
-                    if let Some(ref viewport) = viewport_clone {
-                        viewport.set_destination(dest_w, dest_h);
-                        video_surface_clone.damage_buffer(
-                            0,
-                            0,
-                            VIDEO_ANCHOR_WIDTH,
-                            VIDEO_ANCHOR_HEIGHT,
-                        );
-                        video_surface_clone.commit();
-                        log::debug!("Video host viewport updated to {}x{}", dest_w, dest_h);
-                    } else {
-                        log::error!("No video viewport in pre-commit hook");
-                    }
+                    // The transparent video host remains an immutable 1x1 mapping
+                    // anchor. GStreamer sizes and tags its nested content surfaces.
                 }
             });
 
@@ -754,10 +711,11 @@ impl WaylandSubsurfaceManager {
         log::debug!("Buffer offset changed to {}x{}, surface committed", x, y,);
     }
 
-    /// Set the destination size of the intermediary video host surface.
+    /// Update the logical video area without scaling the intermediary host.
     ///
-    /// `source` is retained for API compatibility but intentionally ignored:
-    /// GStreamer's nested Wayland surfaces own video cropping and scaling.
+    /// The source rectangle is retained for API compatibility but ignored.
+    /// GStreamer owns cropping and sizing on its nested content surfaces, while
+    /// the host must remain an inert 1x1 mapping anchor.
     pub fn set_video_viewport(
         &self,
         source: Option<(i32, i32, i32, i32)>,
@@ -767,22 +725,12 @@ impl WaylandSubsurfaceManager {
             log::debug!("Ignoring host viewport source; GStreamer owns video source cropping");
         }
 
-        let Some((width, height)) = dest else {
-            return;
-        };
-        if width <= 0 || height <= 0 {
-            log::warn!("Ignoring non-positive video viewport {width}x{height}");
-            return;
-        }
-
-        if let Some(ref viewport) = self.video_viewport {
-            viewport.set_destination(width, height);
-            self.video_surface
-                .damage_buffer(0, 0, VIDEO_ANCHOR_WIDTH, VIDEO_ANCHOR_HEIGHT);
-            self.video_surface.commit();
-            log::debug!("Video host viewport destination set to {width}x{height}");
-        } else {
-            log::error!("No video viewport available");
+        if let Some((width, height)) = dest {
+            if width <= 0 || height <= 0 {
+                log::warn!("Ignoring non-positive video viewport {width}x{height}");
+            } else {
+                self.set_size(width, height);
+            }
         }
     }
 
@@ -821,61 +769,24 @@ impl WaylandSubsurfaceManager {
         self.color_manager.lock().is_some()
     }
 
-    /// Returns `true` if the video surface is currently tagged with an HDR
-    /// image description.  When true, the compositor tone-maps the subtitle
-    /// surface (sRGB by default) independently of the HDR video surface.
+    /// Returns whether Subwave tagged the intermediary host as HDR.
+    ///
+    /// This is always false: the host carries only a transparent mapping pixel.
+    /// GStreamer's nested video surface owns the actual HDR image description.
     pub fn is_video_tagged_hdr(&self) -> bool {
-        self.color_manager
-            .lock()
-            .as_ref()
-            .is_some_and(|cm| cm.is_video_tagged_hdr())
+        false
     }
 
-    /// Notify the subsurface manager of the current video stream's colorimetry.
+    /// Observe video colorimetry without applying it to the mapping anchor.
     ///
-    /// When the video is HDR (PQ/HLG transfer) and the compositor supports
-    /// color management, this tags the video surface with a BT.2020+PQ image
-    /// description.  When the video is SDR, any HDR tag is removed so the
-    /// compositor treats the video surface as sRGB.
-    ///
-    /// `colorimetry` is the GStreamer colorimetry string (e.g. `"0:0:14:7"`).
-    /// `metadata` contains optional mastering display / content light level info.
-    ///
-    /// This is safe to call on every caps change — it no-ops if the colorimetry
-    /// hasn't changed.
+    /// Retained for API compatibility. GStreamer 1.28+ applies this metadata to
+    /// the nested surface that actually carries video pixels.
     pub fn notify_video_colorimetry(
         &self,
         colorimetry: &str,
-        metadata: Option<&crate::color_management::HdrMetadata>,
+        _metadata: Option<&crate::color_management::HdrMetadata>,
     ) {
-        let mut cm_lock = self.color_manager.lock();
-        let Some(ref mut cm) = *cm_lock else {
-            return; // no color management support
-        };
-
-        let is_hdr = crate::color_management::HdrMetadata::is_hdr_colorimetry(colorimetry);
-
-        if is_hdr {
-            // Take a single lock on the event queue for both the handle and the roundtrip
-            let mut eq = self.event_queue.lock();
-            let qh = eq.handle();
-            match cm.tag_video_hdr(colorimetry, metadata, &self.video_surface, &qh, &mut eq) {
-                Ok(()) => {
-                    drop(eq);
-                    if let Err(e) = self.flush() {
-                        log::warn!("[color-mgmt] Flush after HDR tag failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    log::warn!("[color-mgmt] Failed to tag video HDR (non-fatal): {e}");
-                }
-            }
-        } else {
-            cm.untag_video(&self.video_surface);
-            if let Err(e) = self.flush() {
-                log::warn!("[color-mgmt] Flush after untag failed: {e}");
-            }
-        }
+        log::debug!("[color-mgmt] Delegating {colorimetry} to waylandsink; host remains untagged");
     }
 
     /// Flush any pending Wayland events
@@ -887,12 +798,11 @@ impl WaylandSubsurfaceManager {
         Ok(())
     }
 
-    /// Force a full surface damage and commit (useful for debugging visibility)
+    /// Force the mutable overlay surfaces to redraw.
+    ///
+    /// The video host is intentionally omitted because its transparent 1x1
+    /// mapping anchor is immutable after construction.
     pub fn force_damage_and_commit(&self) {
-        // Damage the entire surface to force a redraw
-        self.video_surface.damage(0, 0, i32::MAX, i32::MAX);
-        self.video_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        self.video_surface.commit();
         self.background_surface.damage(0, 0, i32::MAX, i32::MAX);
         self.background_surface
             .damage_buffer(0, 0, i32::MAX, i32::MAX);
@@ -901,7 +811,7 @@ impl WaylandSubsurfaceManager {
         self.subtitle_surface
             .damage_buffer(0, 0, i32::MAX, i32::MAX);
         self.subtitle_surface.commit();
-        eprintln!("Forced full damage and commit on video surface");
+        log::debug!("Forced full damage and commit on overlay surfaces");
     }
 
     /// Create or update the black background buffer
@@ -1066,10 +976,10 @@ impl Drop for WaylandSubsurfaceManager {
         }
 
         // Destroy viewports if they exist
-        if let Some(ref viewport) = self.video_viewport {
+        if let Some(ref viewport) = self.background_viewport {
             viewport.destroy();
         }
-        if let Some(ref viewport) = self.background_viewport {
+        if let Some(ref viewport) = self.subtitle_viewport {
             viewport.destroy();
         }
 
