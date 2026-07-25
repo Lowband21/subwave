@@ -1,4 +1,4 @@
-use crate::{Error, Result, WaylandIntegration};
+use crate::{geometry::VideoRectangle, Error, Result, WaylandIntegration};
 use parking_lot::Mutex;
 use std::io::Write;
 use std::os::fd::AsFd;
@@ -63,8 +63,11 @@ pub struct WaylandSubsurfaceManager {
     /// Current position relative to parent
     position: Arc<Mutex<(i32, i32)>>,
 
-    /// Current size
+    /// Current widget/canvas size.
     size: Arc<Mutex<(i32, i32)>>,
+
+    /// Current GStreamer destination relative to the widget canvas.
+    video_rectangle: Mutex<Option<VideoRectangle>>,
 
     /// Flag indicating we need to update on next parent commit
     needs_update: Arc<AtomicBool>,
@@ -100,6 +103,7 @@ impl std::fmt::Debug for WaylandSubsurfaceManager {
         f.debug_struct("WaylandVideoSubsurface")
             .field("position", &self.position.lock())
             .field("size", &self.size.lock())
+            .field("video_rectangle", &self.video_rectangle.lock())
             .field(
                 "needs_update",
                 &self.needs_update.load(std::sync::atomic::Ordering::Relaxed),
@@ -400,6 +404,7 @@ impl WaylandSubsurfaceManager {
                 subtitle_viewport,
                 position: Arc::new(Mutex::new((0, 0))),
                 size: Arc::new(Mutex::new((0, 0))),
+                video_rectangle: Mutex::new(None),
                 needs_update: Arc::new(AtomicBool::new(false)),
                 shm: Some(shm),
                 video_anchor_buffer,
@@ -696,9 +701,17 @@ impl WaylandSubsurfaceManager {
         *self.position.lock()
     }
 
-    /// Get the current size
+    /// Get the current widget/canvas size.
     pub fn get_size(&self) -> (i32, i32) {
         *self.size.lock()
+    }
+
+    pub(crate) fn set_video_rectangle(&self, rectangle: VideoRectangle) {
+        *self.video_rectangle.lock() = Some(rectangle);
+    }
+
+    pub(crate) fn get_video_rectangle(&self) -> Option<VideoRectangle> {
+        *self.video_rectangle.lock()
     }
 
     // Do we have use for this function?
@@ -796,6 +809,13 @@ impl WaylandSubsurfaceManager {
             .flush()
             .map_err(|e| Error::Wayland(format!("Failed to flush events: {}", e)))?;
         Ok(())
+    }
+
+    /// Commit child-subsurface geometry requested by GStreamer.
+    ///
+    /// This does not damage, resize, or retag the transparent mapping anchor.
+    pub(crate) fn commit_video_host_state(&self) {
+        self.video_surface.commit();
     }
 
     /// Force the mutable overlay surfaces to redraw.

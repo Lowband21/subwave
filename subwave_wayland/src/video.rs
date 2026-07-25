@@ -1,5 +1,6 @@
 use crate::internal::Internal;
 use crate::{
+    geometry::VideoRectangle,
     pipeline::SubsurfacePipeline,
     subsurface_manager::WaylandSubsurfaceManager,
     subtitle_runtime::{
@@ -972,12 +973,16 @@ impl SubsurfaceVideo {
                         video_height,
                     } => {
                         let (surface_width, surface_height) = subsurface.get_size();
+                        let video_rectangle = subsurface
+                            .get_video_rectangle()
+                            .unwrap_or_else(|| VideoRectangle::fill(surface_width, surface_height));
                         if let Some(bitmap) = compose_pgs_bitmap(
                             &frames,
                             video_width,
                             video_height,
                             surface_width,
                             surface_height,
+                            video_rectangle,
                         ) {
                             let _ = subsurface.attach_subtitle_frame(
                                 &bitmap.data,
@@ -1186,18 +1191,25 @@ impl SubsurfaceVideo {
         }
     }
 
-    pub fn set_video_size_position(&self, x_offset: i32, y_offset: i32, width: i32, height: i32) {
-        let (pipeline, subsurface) = {
-            let guard = self.0.read();
-            (guard.pipeline.clone(), guard.subsurface.clone())
-        };
-
-        if let Some(p) = pipeline {
+    /// Set GStreamer's video destination relative to the widget canvas without
+    /// changing the canvas used by backgrounds and subtitles.
+    pub(crate) fn set_video_render_rectangle(
+        &self,
+        x_offset: i32,
+        y_offset: i32,
+        width: i32,
+        height: i32,
+    ) {
+        if let Some(p) = self.0.read().pipeline.clone() {
             p.set_render_rectangle(x_offset, y_offset, width, height);
         }
+    }
 
-        if let Some(s) = subsurface {
-            s.set_size(width, height);
+    pub fn set_video_size_position(&self, x_offset: i32, y_offset: i32, width: i32, height: i32) {
+        self.set_video_render_rectangle(x_offset, y_offset, width, height);
+
+        if let Some(subsurface) = self.0.read().subsurface.clone() {
+            subsurface.set_size(width, height);
         }
     }
 

@@ -1,4 +1,4 @@
-use crate::SubsurfaceVideo;
+use crate::{geometry::fit_video_rectangle, SubsurfaceVideo};
 use gstreamer::glib;
 
 type OnError<'a, Message> = Box<dyn Fn(&glib::Error) -> Message + 'a>;
@@ -18,7 +18,7 @@ pub type VideoHandle = Rc<RefCell<Option<Box<SubsurfaceVideo>>>>;
 /// Note: This widget requires the wgpu renderer and Wayland platform
 pub struct VideoPlayer<'a, Message, Theme = iced::Theme> {
     video: &'a VideoHandle,
-    _content_fit: ContentFit,
+    content_fit: ContentFit,
     width: Length,
     height: Length,
     _on_end_of_stream: Option<Message>,
@@ -32,7 +32,7 @@ impl<'a, Message, Theme> VideoPlayer<'a, Message, Theme> {
     pub fn new(video: &'a VideoHandle) -> Self {
         Self {
             video,
-            _content_fit: ContentFit::Contain,
+            content_fit: ContentFit::Contain,
             width: Length::Fill,
             height: Length::Fill,
             _on_end_of_stream: None,
@@ -66,7 +66,7 @@ impl<'a, Message, Theme> VideoPlayer<'a, Message, Theme> {
     /// Set the content fit mode
     pub fn content_fit(self, content_fit: ContentFit) -> Self {
         VideoPlayer {
-            _content_fit: content_fit,
+            content_fit,
             ..self
         }
     }
@@ -211,53 +211,76 @@ where
             }
         }
 
-        // TODO: Calculate and pass the correct aspect ratio to the video player pipeline seemlessly
-        // We should probably add the element to the pipeline on demand if the user changes the default fit mode
         if let Ok(guard) = self.video.try_borrow() {
             if let Some(video) = guard.as_ref() {
-                if let Some(resolution) = video.resolution() {
-                    // Validate video dimensions - must be reasonable
-                    if resolution.0 < 2 || resolution.1 < 2 {
-                        log::debug!(
-                            "WARNING: Invalid video dimensions detected: {}x{}, skipping render",
-                            resolution.0,
-                            resolution.1
+                if let Some((video_width, video_height)) = video.resolution() {
+                    let canvas_width = window_bounds.width.round() as i32;
+                    let canvas_height = window_bounds.height.round() as i32;
+
+                    if let (Some(video_rectangle), Some(subsurface)) = (
+                        fit_video_rectangle(
+                            self.content_fit,
+                            video_width,
+                            video_height,
+                            canvas_width,
+                            canvas_height,
+                        ),
+                        video.get_subsurface(),
+                    ) {
+                        let canvas_position = (
+                            window_bounds.x.round() as i32,
+                            window_bounds.y.round() as i32,
                         );
-                        return; // Skip this draw call until we have valid dimensions
-                    }
+                        let position_changed = subsurface.get_position() != canvas_position;
+                        let canvas_changed = subsurface.get_size() != (canvas_width, canvas_height);
+                        let rectangle_changed =
+                            subsurface.get_video_rectangle() != Some(video_rectangle);
 
-                    let _video_width = resolution.0;
-                    let _video_height = resolution.1;
-                    //let video_aspect = video_width / video_height;
+                        if position_changed || canvas_changed || rectangle_changed {
+                            log::info!(
+                                "Updating video geometry: fit={:?}, source={}x{}, canvas={}x{}, rectangle=({}, {}, {}x{})",
+                                self.content_fit,
+                                video_width,
+                                video_height,
+                                canvas_width,
+                                canvas_height,
+                                video_rectangle.x,
+                                video_rectangle.y,
+                                video_rectangle.width,
+                                video_rectangle.height,
+                            );
 
-                    let widget_width = window_bounds.width;
-                    let widget_height = window_bounds.height;
-                    //let widget_aspect = widget_width / widget_height;
+                            if position_changed {
+                                subsurface.set_position(canvas_position.0, canvas_position.1);
+                            }
 
-                    // Apply the calculated viewport
-                    if let Some(subsurface) = video.get_subsurface() {
-                        let current_size = subsurface.get_size();
-                        let new_width = widget_width.round() as i32;
-                        let new_height = widget_height.round() as i32;
+                            if canvas_changed {
+                                subsurface.update_background(canvas_width, canvas_height);
+                                subsurface.set_size(canvas_width, canvas_height);
+                            }
 
-                        if current_size != (new_width, new_height)
-                            && new_width > 0
-                            && new_height > 0
-                        {
-                            log::info!("Setting new size to {}, {}", new_width, new_height);
-                            subsurface.update_background(new_width, new_height);
-                            subsurface.set_size(new_width, new_height);
-                            video.set_video_size_position(0, 0, new_width, new_height);
-                            subsurface.integration.trigger_pre_commit_hooks();
-                            subsurface.force_damage_and_commit();
-                            match subsurface.flush() {
-                                Ok(_) => (),
-                                Err(e) => log::debug!("Error: {:#?}", e),
+                            if rectangle_changed {
+                                video.set_video_render_rectangle(
+                                    video_rectangle.x,
+                                    video_rectangle.y,
+                                    video_rectangle.width,
+                                    video_rectangle.height,
+                                );
+                                subsurface.set_video_rectangle(video_rectangle);
+                                subsurface.commit_video_host_state();
+                            }
+
+                            if position_changed || canvas_changed {
+                                subsurface.integration.trigger_pre_commit_hooks();
+                                subsurface.force_damage_and_commit();
+                            }
+
+                            if let Err(error) = subsurface.flush() {
+                                log::debug!("Failed to flush video geometry: {error:#?}");
                             }
                         }
 
-                        // Pump updates (bus commands + subtitles) from the UI thread each draw
-                        // We need a mutable reference to call tick()
+                        // Pump updates (bus commands + subtitles) from the UI thread each draw.
                         drop(guard);
                         if let Ok(mut guard2) = self.video.try_borrow_mut() {
                             if let Some(video_mut) = guard2.as_deref_mut() {
