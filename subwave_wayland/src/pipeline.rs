@@ -117,6 +117,10 @@ fn pgs_display_set_event(
     }
 }
 
+fn waylandsink_supports_native_color_management(version: (u32, u32, u32, u32)) -> bool {
+    version.0 > 1 || (version.0 == 1 && version.1 >= 28)
+}
+
 pub struct SubsurfacePipeline {
     speed: f64,
     pub pipeline: Arc<gst::Pipeline>,
@@ -201,17 +205,28 @@ impl SubsurfacePipeline {
             })?;
 
         if vapostproc.has_property("hdr-tone-mapping") {
-            if compositor_has_cm {
-                // Compositor supports color management — let HDR pixels pass
-                // through to waylandsink untouched.  The compositor will do
-                // the tone-mapping using the image description we set on the
-                // surface via wp-color-management-v1.
+            let gst_version = gst::version();
+            let waylandsink_manages_color =
+                waylandsink_supports_native_color_management(gst_version);
+            let native_hdr = compositor_has_cm && waylandsink_manages_color;
+
+            if native_hdr {
+                // GStreamer 1.28+ tags the nested surface that carries the video
+                // buffer. The transparent Subwave host remains untagged/sRGB.
                 vapostproc.set_property("hdr-tone-mapping", false);
-                log::info!("[pipeline] vapostproc hdr-tone-mapping DISABLED (compositor has CM)");
+                log::info!(
+                    "[pipeline] vapostproc hdr-tone-mapping DISABLED (waylandsink owns HDR surface metadata)"
+                );
             } else {
-                // No compositor CM — vapostproc must tone-map HDR→SDR itself.
+                // Never put stream metadata on the transparent host as a fallback.
+                // Tone-map to SDR when either side cannot manage the real surface.
                 vapostproc.set_property("hdr-tone-mapping", true);
-                log::info!("[pipeline] vapostproc hdr-tone-mapping ENABLED (no compositor CM)");
+                log::info!(
+                    "[pipeline] vapostproc hdr-tone-mapping ENABLED (compositor_cm={compositor_has_cm}, gstreamer={}.{}.{})",
+                    gst_version.0,
+                    gst_version.1,
+                    gst_version.2,
+                );
             }
         }
 
@@ -981,7 +996,9 @@ impl Drop for SubsurfacePipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::{pgs_display_set_event, WaylandSubtitlePayload};
+    use super::{
+        pgs_display_set_event, waylandsink_supports_native_color_management, WaylandSubtitlePayload,
+    };
     use crate::{
         pgs_decoder::{PgsDisplaySet, PgsFrame},
         subtitle_scheduler::{DecodedSubtitleEvent, SubtitleAction, SubtitleScheduler},
@@ -992,6 +1009,13 @@ mod tests {
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
+    }
+
+    #[test]
+    fn native_wayland_color_management_requires_gstreamer_1_28() {
+        assert!(!waylandsink_supports_native_color_management((1, 27, 9, 0)));
+        assert!(waylandsink_supports_native_color_management((1, 28, 0, 0)));
+        assert!(waylandsink_supports_native_color_management((2, 0, 0, 0)));
     }
 
     #[test]
