@@ -13,6 +13,7 @@ Wayland subsurface-based video output for Iced with HDR passthrough support.
 - [x] GStreamer pipeline with waylandsink
 - [x] Wayland display context sharing
 - [x] Pre-commit hook synchronization for position updates
+- [x] `ContentFit` geometry for Contain, Cover, Fill, None, and ScaleDown
 - [x] Zero-copy video rendering with hardware acceleration
 
 ## Architecture
@@ -32,6 +33,7 @@ This crate implements video playback using Wayland subsurfaces, which allows:
    - Iced widget that reserves space in layout
    - Accesses WaylandIntegration via thread-local storage
    - Updates subsurface position based on widget bounds
+   - Maps Iced `ContentFit` modes to GStreamer's render rectangle
 
 3. **Pipeline** (`pipeline.rs`)
    - Dynamic pipeline creation
@@ -86,8 +88,7 @@ This approach ensures proper video display and prevents transparency issues, but
 ### Next Steps
 1. Subtitle management
   - Requires upstream gstreamer changes
-2. Add content fit support through aspect ratio pipeline element
-3. Playback speed integration
+2. Playback speed integration
 
 ## Usage
 
@@ -104,7 +105,8 @@ let video = SubsurfaceVideo::new(&url).expect("Failed to create video");
 // Build an Iced widget to reserve layout space and drive updates
 let player = VideoPlayer::new(&video)
     .width(iced::Length::Fill)
-    .height(iced::Length::Fill);
+    .height(iced::Length::Fill)
+    .content_fit(iced::ContentFit::Contain);
 ```
 
 Note: Keep the `SubsurfaceVideo` alive for the duration of playback.
