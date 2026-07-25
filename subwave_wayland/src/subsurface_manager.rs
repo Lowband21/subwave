@@ -1,6 +1,6 @@
 use crate::{Error, Result, WaylandIntegration};
 use parking_lot::Mutex;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,8 +30,9 @@ pub struct WaylandSubsurfaceManager {
     // The Wayland integration data from Iced
     pub integration: WaylandIntegration,
 
-    /// Event queue for handling Wayland events
+    /// Event queue and dispatch state for handling buffer release events.
     event_queue: Mutex<EventQueue<State>>,
+    dispatch_state: Mutex<State>,
 
     /// Shared compositor
     compositor: WlCompositor,
@@ -82,11 +83,16 @@ pub struct WaylandSubsurfaceManager {
     background_buffer: Mutex<Option<WlBuffer>>,
     background_pool: Mutex<Option<WlShmPool>>,
 
-    /// Subtitle buffer resources
-    subtitle_buffer: Mutex<Option<WlBuffer>>,
-    subtitle_pool: Mutex<Option<WlShmPool>>,
-    subtitle_file: Mutex<Option<std::fs::File>>,
-    subtitle_pool_dims: Mutex<Option<(i32, i32, i32)>>, // (w,h,stride)
+    /// Release-aware subtitle frame buffers. A busy wl_shm buffer must never be
+    /// modified until the compositor sends wl_buffer.release.
+    subtitle_buffers: Mutex<Vec<SubtitleBufferSlot>>,
+
+    /// Immutable, fully transparent buffers used instead of unmapping the
+    /// subtitle surface. Keeping the surface mapped stabilizes Gamescope's HDR
+    /// plane/composition graph across subtitle show/clear transitions.
+    subtitle_clear_buffers: Mutex<Vec<SubtitleBufferSlot>>,
+    subtitle_visible: AtomicBool,
+    keep_subtitle_mapped: bool,
 
     /// Compositor color-management capability handle.
     ///
@@ -105,6 +111,12 @@ impl std::fmt::Debug for WaylandSubsurfaceManager {
                 &self.needs_update.load(std::sync::atomic::Ordering::Relaxed),
             )
             .field("has_buffer", &self.background_buffer.lock().is_some())
+            .field("subtitle_buffers", &self.subtitle_buffers.lock().len())
+            .field(
+                "subtitle_visible",
+                &self.subtitle_visible.load(Ordering::Relaxed),
+            )
+            .field("keep_subtitle_mapped", &self.keep_subtitle_mapped)
             .finish()
     }
 }
@@ -122,10 +134,43 @@ impl State {
     }
 }
 
+fn is_gamescope_compositor(globals: &[(u32, String, u32)]) -> bool {
+    globals
+        .iter()
+        .any(|(_, interface, _)| interface.starts_with("gamescope_"))
+}
+
 const VIDEO_ANCHOR_WIDTH: i32 = 1;
 const VIDEO_ANCHOR_HEIGHT: i32 = 1;
 const VIDEO_ANCHOR_STRIDE: i32 = VIDEO_ANCHOR_WIDTH * 4;
 const VIDEO_ANCHOR_SIZE: usize = (VIDEO_ANCHOR_STRIDE * VIDEO_ANCHOR_HEIGHT) as usize;
+const MAX_SUBTITLE_BUFFERS: usize = 2;
+
+#[derive(Clone, Debug)]
+struct SubtitleBufferData {
+    released: Arc<AtomicBool>,
+}
+
+struct SubtitleBufferSlot {
+    buffer: WlBuffer,
+    pool: WlShmPool,
+    file: std::fs::File,
+    dimensions: (i32, i32, i32),
+    released: Arc<AtomicBool>,
+}
+
+impl SubtitleBufferSlot {
+    fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SubtitleBufferSlot {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
+}
 
 fn create_transparent_video_anchor(
     shm: &WlShm,
@@ -179,6 +224,13 @@ impl WaylandSubsurfaceManager {
             event_queue
                 .roundtrip(&mut state)
                 .map_err(|e| Error::Wayland(format!("Failed to roundtrip: {}", e)))?;
+
+            let keep_subtitle_mapped = is_gamescope_compositor(&state.globals);
+            if keep_subtitle_mapped {
+                log::info!(
+                    "[subs] Gamescope detected; keeping the subtitle surface permanently mapped"
+                );
+            }
 
             let compositor = if let Some(compositor_global) = state
                 .globals
@@ -389,6 +441,7 @@ impl WaylandSubsurfaceManager {
                 _connection: connection,
                 integration: integration.clone(),
                 event_queue: Mutex::new(event_queue),
+                dispatch_state: Mutex::new(state),
                 compositor,
                 video_subsurface,
                 background_subsurface,
@@ -406,10 +459,10 @@ impl WaylandSubsurfaceManager {
                 video_anchor_pool,
                 background_buffer: Mutex::new(None),
                 background_pool: Mutex::new(None),
-                subtitle_buffer: Mutex::new(None),
-                subtitle_pool: Mutex::new(None),
-                subtitle_file: Mutex::new(None),
-                subtitle_pool_dims: Mutex::new(None),
+                subtitle_buffers: Mutex::new(Vec::new()),
+                subtitle_clear_buffers: Mutex::new(Vec::new()),
+                subtitle_visible: AtomicBool::new(false),
+                keep_subtitle_mapped,
                 color_manager: Mutex::new(color_manager),
             });
 
@@ -504,21 +557,81 @@ impl WaylandSubsurfaceManager {
         }
     }
 
-    /// Attach a rendered ARGB32 subtitle frame to the subtitle surface and commit
-    pub fn attach_subtitle_frame(
+    fn subtitle_buffer_size(stride: i32, height: i32) -> Result<usize> {
+        if stride <= 0 || height <= 0 {
+            return Err(Error::Wayland(format!(
+                "Invalid subtitle buffer dimensions: stride={stride}, height={height}"
+            )));
+        }
+
+        (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|size| *size <= i32::MAX as usize)
+            .ok_or_else(|| Error::Wayland("Subtitle buffer size overflow".into()))
+    }
+
+    fn create_subtitle_buffer<U>(
+        &self,
+        width: i32,
+        height: i32,
+        stride: i32,
+        user_data: U,
+        released: Arc<AtomicBool>,
+    ) -> Result<SubtitleBufferSlot>
+    where
+        State: Dispatch<WlBuffer, U>,
+        U: Send + Sync + 'static,
+    {
+        let needed = Self::subtitle_buffer_size(stride, height)?;
+        let file =
+            tempfile().map_err(|error| Error::Wayland(format!("subtitle tempfile: {error}")))?;
+        file.set_len(needed as u64)
+            .map_err(|error| Error::Wayland(format!("subtitle resize: {error}")))?;
+
+        let qh = self.event_queue.lock().handle();
+        let shm = self
+            .shm
+            .as_ref()
+            .ok_or_else(|| Error::Wayland("No wl_shm for subtitle".into()))?;
+        let pool = shm.create_pool(file.as_fd(), needed as i32, &qh, ());
+        let buffer = pool.create_buffer(0, width, height, stride, Format::Argb8888, &qh, user_data);
+
+        Ok(SubtitleBufferSlot {
+            buffer,
+            pool,
+            file,
+            dimensions: (width, height, stride),
+            released,
+        })
+    }
+
+    fn dispatch_pending_events(&self) -> Result<()> {
+        let mut event_queue = self.event_queue.lock();
+        let mut state = self.dispatch_state.lock();
+        event_queue.dispatch_pending(&mut state).map_err(|error| {
+            Error::Wayland(format!("Failed to dispatch Wayland events: {error}"))
+        })?;
+        Ok(())
+    }
+
+    fn roundtrip_events(&self) -> Result<()> {
+        let mut event_queue = self.event_queue.lock();
+        let mut state = self.dispatch_state.lock();
+        event_queue
+            .roundtrip(&mut state)
+            .map_err(|error| Error::Wayland(format!("Failed Wayland roundtrip: {error}")))?;
+        Ok(())
+    }
+
+    fn acquire_subtitle_frame_buffer(
         &self,
         data: &[u8],
         width: i32,
         height: i32,
         stride: i32,
-    ) -> Result<()> {
-        if self.shm.is_none() {
-            return Err(Error::Wayland("No wl_shm for subtitle".into()));
-        }
-        if width <= 0 || height <= 0 || stride <= 0 {
-            return Ok(()); // degenerate frame, skip
-        }
-        let needed = (stride as usize) * (height as usize);
+    ) -> Result<WlBuffer> {
+        let dimensions = (width, height, stride);
+        let needed = Self::subtitle_buffer_size(stride, height)?;
         if data.len() < needed {
             return Err(Error::Wayland(format!(
                 "Subtitle data too small: {} < {} ({}x{} stride={})",
@@ -529,81 +642,159 @@ impl WaylandSubsurfaceManager {
                 stride
             )));
         }
-        log::debug!(
-            "[subs] attach_subtitle_frame called: {}x{} stride={} ({} bytes)",
-            width,
-            height,
-            stride,
-            needed
-        );
 
-        let mut pool_guard = self.subtitle_pool.lock();
-        let mut buf_guard = self.subtitle_buffer.lock();
-        let mut file_guard = self.subtitle_file.lock();
-        let mut dims_guard = self.subtitle_pool_dims.lock();
+        self.dispatch_pending_events()?;
 
-        let need_recreate = match *dims_guard {
-            Some((w, h, s)) => w != width || h != height || s != stride,
-            None => true,
-        };
-        if need_recreate {
-            log::info!(
-                "[subs] Recreating subtitle buffer/pool for size {}x{} stride={}",
-                width,
-                height,
-                stride
-            );
-            if let Some(old) = buf_guard.take() {
-                old.destroy();
-            }
-            if let Some(old) = pool_guard.take() {
-                old.destroy();
-            }
-            *file_guard = None;
+        for attempt in 0..2 {
+            let mut slots = self.subtitle_buffers.lock();
+            let matching = slots
+                .iter()
+                .position(|slot| slot.dimensions == dimensions && slot.is_released());
+            let reusable =
+                matching.or_else(|| slots.iter().position(SubtitleBufferSlot::is_released));
 
-            let file = tempfile::tempfile()
-                .map_err(|e| Error::Wayland(format!("subtitle tempfile: {}", e)))?;
+            let index = if let Some(index) = reusable {
+                if slots[index].dimensions != dimensions {
+                    let old = slots.swap_remove(index);
+                    drop(old);
+                    let released = Arc::new(AtomicBool::new(true));
+                    let user_data = SubtitleBufferData {
+                        released: Arc::clone(&released),
+                    };
+                    slots.push(
+                        self.create_subtitle_buffer(width, height, stride, user_data, released)?,
+                    );
+                    slots.len() - 1
+                } else {
+                    index
+                }
+            } else if slots.len() < MAX_SUBTITLE_BUFFERS {
+                let released = Arc::new(AtomicBool::new(true));
+                let user_data = SubtitleBufferData {
+                    released: Arc::clone(&released),
+                };
+                slots
+                    .push(self.create_subtitle_buffer(width, height, stride, user_data, released)?);
+                slots.len() - 1
+            } else {
+                drop(slots);
+                if attempt == 0 {
+                    // A roundtrip guarantees that release events for previously
+                    // replaced buffers are delivered before dropping a cue.
+                    self.roundtrip_events()?;
+                    continue;
+                }
+                return Err(Error::Wayland(
+                    "No released subtitle buffer available after Wayland roundtrip".into(),
+                ));
+            };
 
-            file.set_len(needed as u64)
-                .map_err(|e| Error::Wayland(format!("subtitle resize: {}", e)))?;
-
-            let event_queue = self.event_queue.lock();
-            let qh = event_queue.handle();
-            let shm = self.shm.as_ref().unwrap();
-            let pool = shm.create_pool(file.as_fd(), needed as i32, &qh, ());
-            let buffer = pool.create_buffer(0, width, height, stride, Format::Argb8888, &qh, ());
-
-            *pool_guard = Some(pool);
-            *buf_guard = Some(buffer);
-            *file_guard = Some(file);
-            *dims_guard = Some((width, height, stride));
+            let slot = &mut slots[index];
+            slot.file
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| Error::Wayland(format!("subtitle seek: {error}")))?;
+            slot.file
+                .write_all(&data[..needed])
+                .map_err(|error| Error::Wayland(format!("subtitle write: {error}")))?;
+            slot.file
+                .flush()
+                .map_err(|error| Error::Wayland(format!("subtitle flush: {error}")))?;
+            slot.released.store(false, Ordering::Release);
+            return Ok(slot.buffer.clone());
         }
 
-        if let Some(file) = file_guard.as_mut() {
-            use std::io::{Seek, SeekFrom, Write};
-            file.seek(SeekFrom::Start(0))
-                .map_err(|e| Error::Wayland(format!("subtitle seek: {}", e)))?;
-            file.write_all(data)
-                .map_err(|e| Error::Wayland(format!("subtitle write: {}", e)))?;
-            file.flush().ok();
+        Err(Error::Wayland("Failed to acquire subtitle buffer".into()))
+    }
+
+    fn transparent_subtitle_buffer(
+        &self,
+        width: i32,
+        height: i32,
+        stride: i32,
+    ) -> Result<WlBuffer> {
+        let dimensions = (width, height, stride);
+        let mut slots = self.subtitle_clear_buffers.lock();
+        if let Some(slot) = slots.iter().find(|slot| slot.dimensions == dimensions) {
+            return Ok(slot.buffer.clone());
         }
 
-        if let Some(ref buffer) = &*buf_guard {
-            log::debug!("[subs] Attaching buffer to subtitle surface and committing");
-            self.subtitle_surface.attach(Some(buffer), 0, 0);
-            self.subtitle_surface.damage(0, 0, width, height);
-            self.subtitle_surface.commit();
-        } else {
-            log::warn!("[subs] Subtitle surface/buffer missing; cannot attach subtitle frame");
-        }
+        // A newly extended tempfile reads as all-zero premultiplied ARGB, so it
+        // is a fully transparent immutable buffer and never needs release-based
+        // reuse tracking.
+        let released = Arc::new(AtomicBool::new(true));
+        slots.push(self.create_subtitle_buffer(width, height, stride, (), released)?);
+        Ok(slots
+            .last()
+            .expect("just inserted subtitle buffer")
+            .buffer
+            .clone())
+    }
+
+    fn map_transparent_subtitle(&self, width: i32, height: i32) -> Result<()> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let stride = width
+            .checked_mul(4)
+            .ok_or_else(|| Error::Wayland("Subtitle stride overflow".into()))?;
+        let buffer = self.transparent_subtitle_buffer(width, height, stride)?;
+
+        self.subtitle_surface.attach(Some(&buffer), 0, 0);
+        self.subtitle_surface.damage_buffer(0, 0, width, height);
+        self.subtitle_surface.commit();
         Ok(())
     }
 
-    /// Clear the subtitle surface by detaching any buffer and committing
-    pub fn clear_subtitle(&self) -> Result<()> {
-        log::debug!("[subs] Clearing subtitle surface (detach + commit)");
-        self.subtitle_surface.attach(None, 0, 0);
+    /// Attach a rendered ARGB32 subtitle frame to the subtitle surface and commit.
+    pub fn attach_subtitle_frame(
+        &self,
+        data: &[u8],
+        width: i32,
+        height: i32,
+        stride: i32,
+    ) -> Result<()> {
+        if width <= 0 || height <= 0 || stride <= 0 {
+            return Ok(());
+        }
+
+        let buffer = self.acquire_subtitle_frame_buffer(data, width, height, stride)?;
+        log::debug!(
+            "[subs] Attaching release-safe subtitle buffer {}x{} stride={}",
+            width,
+            height,
+            stride
+        );
+        self.subtitle_surface.attach(Some(&buffer), 0, 0);
+        self.subtitle_surface.damage_buffer(0, 0, width, height);
         self.subtitle_surface.commit();
+        self.subtitle_visible.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Clear subtitles. Gamescope retains an immutable transparent buffer to
+    /// avoid HDR plane transitions; other compositors keep the normal unmap path.
+    pub fn clear_subtitle(&self) -> Result<()> {
+        let (width, height) = self.get_size();
+        log::debug!(
+            "[subs] Clearing subtitle (stable_mapping={}, size={}x{})",
+            self.keep_subtitle_mapped,
+            width.max(1),
+            height.max(1)
+        );
+        self.subtitle_visible.store(false, Ordering::Release);
+
+        if self.keep_subtitle_mapped {
+            if let Err(error) = self.map_transparent_subtitle(width, height) {
+                // Never leave stale subtitle pixels visible if allocating the stable
+                // clear buffer fails. Unmapping is a less stable but safe fallback.
+                self.subtitle_surface.attach(None, 0, 0);
+                self.subtitle_surface.commit();
+                return Err(error);
+            }
+        } else {
+            self.subtitle_surface.attach(None, 0, 0);
+            self.subtitle_surface.commit();
+        }
+
         Ok(())
     }
 
@@ -686,9 +877,30 @@ impl WaylandSubsurfaceManager {
     }
 
     pub fn set_size(&self, w: i32, h: i32) {
+        let changed = {
+            let mut size = self.size.lock();
+            if *size == (w, h) {
+                false
+            } else {
+                *size = (w, h);
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+
         log::info!("[subs] WaylandSubsurfaceManager::set_size -> {}x{}", w, h);
-        *self.size.lock() = (w, h);
         self.needs_update.store(true, Ordering::Relaxed);
+
+        // Map the transparent subtitle plane before the first cue and keep it
+        // mapped between cues. If a cue is active, retain it and let the
+        // viewport scale it until the next subtitle update.
+        if self.keep_subtitle_mapped && !self.subtitle_visible.load(Ordering::Acquire) {
+            if let Err(error) = self.map_transparent_subtitle(w, h) {
+                log::warn!("[subs] Failed to map transparent subtitle buffer: {error}");
+            }
+        }
     }
 
     /// Get the current position
@@ -789,8 +1001,9 @@ impl WaylandSubsurfaceManager {
         log::debug!("[color-mgmt] Delegating {colorimetry} to waylandsink; host remains untagged");
     }
 
-    /// Flush any pending Wayland events
+    /// Dispatch queued events and flush pending Wayland requests.
     pub fn flush(&self) -> Result<()> {
+        self.dispatch_pending_events()?;
         self.event_queue
             .lock()
             .flush()
@@ -962,13 +1175,8 @@ impl Drop for WaylandSubsurfaceManager {
         if let Some(pool) = self.background_pool.lock().take() {
             pool.destroy();
         }
-        if let Some(buffer) = self.subtitle_buffer.lock().take() {
-            buffer.destroy();
-        }
-        if let Some(pool) = self.subtitle_pool.lock().take() {
-            pool.destroy();
-        }
-        self.subtitle_file.lock().take();
+        self.subtitle_buffers.lock().clear();
+        self.subtitle_clear_buffers.lock().clear();
 
         // Destroy color management resources before surfaces
         if let Some(mut cm) = self.color_manager.lock().take() {
@@ -1136,11 +1344,25 @@ impl Dispatch<WlBuffer, ()> for State {
     ) {
         use wayland_client::protocol::wl_buffer::Event;
         if let Event::Release = event {
-            // Buffer has been released by compositor - it's now available for reuse
-            // In a real video player, this would trigger the next frame
-            // For our test, we just note it
-            log::debug!("Buffer released by compositor - ready for reuse");
-            // Note: We keep the buffer alive so the surface doesn't become empty
+            // Immutable anchors/backgrounds do not need release-based reuse.
+            log::debug!("Immutable Wayland buffer released by compositor");
+        }
+    }
+}
+
+impl Dispatch<WlBuffer, SubtitleBufferData> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlBuffer,
+        event: <WlBuffer as Proxy>::Event,
+        data: &SubtitleBufferData,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        use wayland_client::protocol::wl_buffer::Event;
+        if let Event::Release = event {
+            data.released.store(true, Ordering::Release);
+            log::debug!("Subtitle buffer released by compositor");
         }
     }
 }
@@ -1168,5 +1390,25 @@ impl Dispatch<WpViewport, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         // Viewport doesn't have events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_gamescope_compositor;
+
+    #[test]
+    fn detects_gamescope_specific_globals() {
+        let gamescope_globals = vec![
+            (1, "wl_compositor".to_string(), 6),
+            (2, "gamescope_control".to_string(), 6),
+        ];
+        let generic_globals = vec![
+            (1, "wl_compositor".to_string(), 6),
+            (2, "wp_color_manager_v1".to_string(), 1),
+        ];
+
+        assert!(is_gamescope_compositor(&gamescope_globals));
+        assert!(!is_gamescope_compositor(&generic_globals));
     }
 }
